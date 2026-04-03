@@ -17,8 +17,42 @@ export interface FinalPlan {
   disclaimers: string[];
 }
 
+export interface OllamaInventory {
+  availableModels: string[];
+  runningModels: string[];
+}
+
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const ollama = new Ollama({ host: process.env.OLLAMA_HOST });
+
+export async function getOllamaInventory(): Promise<OllamaInventory> {
+  try {
+    const listResponse = await ollama.list();
+    const availableModels = ((listResponse as { models?: Array<{ model?: string; name?: string }> }).models ?? [])
+      .map((model) => model.model ?? model.name ?? "")
+      .filter((name) => Boolean(name));
+
+    let runningModels: string[] = [];
+    try {
+      const psResponse = await ollama.ps();
+      runningModels = ((psResponse as { models?: Array<{ model?: string; name?: string }> }).models ?? [])
+        .map((model) => model.model ?? model.name ?? "")
+        .filter((name) => Boolean(name));
+    } catch {
+      runningModels = [];
+    }
+
+    return {
+      availableModels: [...new Set(availableModels)],
+      runningModels: [...new Set(runningModels)]
+    };
+  } catch {
+    return {
+      availableModels: [],
+      runningModels: []
+    };
+  }
+}
 
 export async function decideNextAction(input: {
   currentPath: string;
