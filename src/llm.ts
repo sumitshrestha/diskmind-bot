@@ -167,6 +167,7 @@ async function chat(prompt: string): Promise<string> {
   const response = await ollama.chat({
     model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
     messages: [{ role: "user", content: prompt }],
+    format: "json",
     options: { temperature: 0.1 }
   });
 
@@ -175,29 +176,88 @@ async function chat(prompt: string): Promise<string> {
 
 function parseJson<T>(raw: string): T | null {
   const trimmed = raw.trim();
-
-  try {
-    return JSON.parse(trimmed) as T;
-  } catch {
-    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fenced?.[1]) {
-      try {
-        return JSON.parse(fenced[1]) as T;
-      } catch {
-        return null;
-      }
-    }
-
-    const firstBrace = trimmed.indexOf("{");
-    const lastBrace = trimmed.lastIndexOf("}");
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-      try {
-        return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) as T;
-      } catch {
-        return null;
-      }
-    }
-
+  if (!trimmed) {
     return null;
   }
+
+  // Some local models prepend chain-of-thought style tags before JSON.
+  const withoutThinkingBlocks = trimmed.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const direct = tryParseJson<T>(withoutThinkingBlocks);
+  if (direct) {
+    return direct;
+  }
+
+  const fenced = withoutThinkingBlocks.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    const fencedParsed = tryParseJson<T>(fenced[1].trim());
+    if (fencedParsed) {
+      return fencedParsed;
+    }
+  }
+
+  const extracted = extractFirstJsonObject(withoutThinkingBlocks);
+  if (!extracted) {
+    return null;
+  }
+
+  return tryParseJson<T>(extracted);
+}
+
+function tryParseJson<T>(text: string): T | null {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+function extractFirstJsonObject(text: string): string | null {
+  let inString = false;
+  let escapeNext = false;
+  let depth = 0;
+  let start = -1;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+
+    if (inString) {
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+
+      if (ch === "\\") {
+        escapeNext = true;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = false;
+      }
+
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      if (depth === 0) {
+        start = i;
+      }
+      depth += 1;
+      continue;
+    }
+
+    if (ch === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
 }
