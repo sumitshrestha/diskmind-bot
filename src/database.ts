@@ -75,6 +75,7 @@ export function mergeTopFiles(map: DiskMindMap, files: DiskNode[], limit = 50): 
     if (existing) {
       existing.sizeGB = Math.max(existing.sizeGB, file.sizeGB);
       existing.lastModifiedISO = file.lastModifiedISO;
+      existing.lastAccessedISO = file.lastAccessedISO;
       existing.extension = file.extension;
     } else {
       map.topFiles.push(file);

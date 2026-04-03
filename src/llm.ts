@@ -226,6 +226,7 @@ export async function createFinalPlan(input: {
   scannedPaths: string[];
 }): Promise<FinalPlan> {
   let failureReason: string | null = null;
+  const fallbackPlan = buildDeterministicFallbackPlan(input);
   const budget = await getPromptBudget();
   const compactSavings = summarizeSavings(input.potentialSavings, budget.planSavingsLimit);
   const compactTopFiles = summarizeNodes(input.topFiles, budget.planTopFilesLimit);
@@ -279,8 +280,7 @@ export async function createFinalPlan(input: {
       const mediumRiskChecklist = sanitizeChecklist(parsed.mediumRiskChecklist);
       const highRiskChecklist = sanitizeChecklist(parsed.highRiskChecklist);
       const offloadChecklist = sanitizeChecklist(parsed.offloadChecklist);
-
-      return {
+      const candidatePlan: FinalPlan = {
         summary: parsed.summary ?? "No summary produced.",
         zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
         mediumRiskChecklist,
@@ -288,6 +288,22 @@ export async function createFinalPlan(input: {
         offloadChecklist,
         disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
       };
+
+      if (passesSemanticPlanValidation(candidatePlan, input)) {
+        return candidatePlan;
+      }
+
+      void llmLog({
+        call: "createFinalPlan",
+        provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+        model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+        prompt: "semantic-validation",
+        raw: JSON.stringify(candidatePlan),
+        parseOk: false,
+        error: "Plan rejected by semantic validation; deterministic fallback used."
+      });
+
+      return fallbackPlan;
     }
   } catch (error) {
     const message = getErrorMessage(error);
@@ -307,17 +323,14 @@ export async function createFinalPlan(input: {
   const unavailable = failureReason && isLikelyTransportFailure(failureReason);
 
   return {
+    ...fallbackPlan,
     summary: unavailable
-      ? "LLM request failed (likely local Ollama availability/timeout). Manual review required."
-      : "Model response could not be parsed. Manual review required.",
-    zeroRiskPowershell: "# Manual script creation required",
-    mediumRiskChecklist: ["Review large unused applications."],
-    highRiskChecklist: ["Inspect personal media and project folders manually."],
-    offloadChecklist: buildFallbackOffloadChecklist(input.topFiles),
+      ? `LLM request failed (likely local Ollama availability/timeout). ${fallbackPlan.summary}`
+      : fallbackPlan.summary,
     disclaimers: [
       unavailable
-        ? `LLM request failed: ${failureReason}; no automated recommendations trusted.`
-        : "LLM output parsing failed; no automated recommendations trusted."
+        ? `LLM request failed: ${failureReason}; deterministic fallback recommendations were used.`
+        : "LLM output parsing/validation failed; deterministic fallback recommendations were used."
     ]
   };
 }
@@ -496,6 +509,41 @@ function isUsableFinalPlan(plan: FinalPlan | null): boolean {
   );
 }
 
+function passesSemanticPlanValidation(
+  plan: FinalPlan,
+  input: { potentialSavings: PotentialSaving[]; topFiles: DiskNode[]; scannedPaths: string[] }
+): boolean {
+  const zeroRiskPaths = new Set(input.potentialSavings.map((item) => item.path.toLowerCase()));
+  const topFilePaths = input.topFiles.map((file) => file.path);
+  const genericSummary = plan.summary.trim().length < 40 || /^total size:/i.test(plan.summary.trim());
+  if (genericSummary) {
+    return false;
+  }
+
+  if (plan.zeroRiskPowershell.includes("Remove-Item") && !plan.zeroRiskPowershell.includes("-WhatIf")) {
+    return false;
+  }
+
+  const scriptPaths = Array.from(plan.zeroRiskPowershell.matchAll(/[A-Za-z]:\\[^'"\r\n]+/g)).map((match) => match[0].toLowerCase());
+  if (scriptPaths.some((path) => !Array.from(zeroRiskPaths).some((allowed) => path.startsWith(allowed)))) {
+    return false;
+  }
+
+  if (!containsConcretePath(plan.mediumRiskChecklist, topFilePaths)) {
+    return false;
+  }
+
+  if (!containsConcretePath(plan.offloadChecklist, topFilePaths)) {
+    return false;
+  }
+
+  if (plan.offloadChecklist.some((item) => !/last accessed/i.test(item))) {
+    return false;
+  }
+
+  return true;
+}
+
 function sanitizeChecklist(items: string[]): string[] {
   const output: string[] = [];
 
@@ -533,6 +581,76 @@ function buildFallbackOffloadChecklist(topFiles: DiskNode[]): string[] {
       const access = file.lastAccessedISO ? ` last accessed ${file.lastAccessedISO}` : " last access unknown";
       return `Consider offloading ${file.path} (${file.sizeGB.toFixed(3)} GB,${access}) to external storage.`;
     });
+}
+
+function containsConcretePath(items: string[], knownPaths: string[]): boolean {
+  const lowerKnown = knownPaths.map((path) => path.toLowerCase());
+  return items.some((item) => lowerKnown.some((path) => item.toLowerCase().includes(path.toLowerCase())));
+}
+
+function buildDeterministicFallbackPlan(input: {
+  potentialSavings: PotentialSaving[];
+  topFiles: DiskNode[];
+  scannedPaths: string[];
+}): FinalPlan {
+  const zeroRiskCount = input.potentialSavings.length;
+  const zeroRiskTotal = input.potentialSavings.reduce((sum, item) => sum + item.sizeGB, 0);
+  const staleTopFiles = [...input.topFiles]
+    .filter((file) => !file.isDirectory)
+    .sort(compareByStalenessThenSize)
+    .slice(0, 8);
+  const mediumRiskChecklist = input.topFiles
+    .filter((file) => !file.isDirectory)
+    .slice(0, 6)
+    .map((file) => `Review ${file.path} (${file.sizeGB.toFixed(3)} GB) before deleting or archiving.`);
+  const highRiskChecklist = staleTopFiles
+    .slice(0, 6)
+    .map((file) => `Verify ownership and importance of ${file.path} (${file.sizeGB.toFixed(3)} GB) before any destructive action.`);
+
+  return {
+    summary:
+      `Detected ${zeroRiskCount} low-risk cleanup targets totaling ${zeroRiskTotal.toFixed(3)} GB. ` +
+      `Large non-system files should be reviewed for archive or offload rather than deleted outright. ` +
+      `Start with the generated zero-risk cleanup script, then move stale large files to external storage.` ,
+    zeroRiskPowershell: buildDeterministicZeroRiskScript(input.potentialSavings),
+    mediumRiskChecklist,
+    highRiskChecklist,
+    offloadChecklist: staleTopFiles.map((file) => {
+      const access = file.lastAccessedISO ?? "unknown";
+      return `Move ${file.path} (${file.sizeGB.toFixed(3)} GB, last accessed ${access}) to external storage if no longer needed locally.`;
+    }),
+    disclaimers: ["Review all recommendations manually before running scripts or moving files."]
+  };
+}
+
+function buildDeterministicZeroRiskScript(potentialSavings: PotentialSaving[]): string {
+  const uniquePaths = Array.from(new Set(potentialSavings.map((item) => item.path))).slice(0, 20);
+  const lines = [
+    "# Deterministic zero-risk cleanup script",
+    "# Review before running. All removals use -WhatIf.",
+    ""
+  ];
+
+  for (const path of uniquePaths) {
+    const normalized = path.replace(/'/g, "''");
+    const wildcard = /\\Temp$/i.test(path) || /\$Recycle\.Bin$/i.test(path) ? "\\*" : "";
+    lines.push(`# Remove zero-risk path: ${path}`);
+    lines.push(`Remove-Item -Path '${normalized}${wildcard}' -Recurse -Force -WhatIf -ErrorAction SilentlyContinue`);
+    lines.push("");
+  }
+
+  return lines.join("\n").trim();
+}
+
+function compareByStalenessThenSize(left: DiskNode, right: DiskNode): number {
+  const leftAccess = left.lastAccessedISO ? Date.parse(left.lastAccessedISO) : Number.POSITIVE_INFINITY;
+  const rightAccess = right.lastAccessedISO ? Date.parse(right.lastAccessedISO) : Number.POSITIVE_INFINITY;
+
+  if (leftAccess !== rightAccess) {
+    return leftAccess - rightAccess;
+  }
+
+  return right.sizeGB - left.sizeGB;
 }
 
 function getErrorMessage(error: unknown): string {
