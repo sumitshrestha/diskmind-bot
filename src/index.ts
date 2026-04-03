@@ -7,6 +7,8 @@ import { getDefaultRoots, getExistingRoots } from "./scanner";
 import { getOllamaInventory } from "./llm";
 
 async function main(): Promise<void> {
+  const startedAt = Date.now();
+
   try {
     console.log("DiskMind starting in read-only mode...");
     const startupConfig = await askStartupOptions();
@@ -23,10 +25,29 @@ async function main(): Promise<void> {
     console.log(`Map database: ${getDatabasePath()}`);
     console.log(`Cleanup report: ${result.reportPath}`);
     console.log(`PowerShell script (manual execution only): ${result.scriptPath}`);
+    console.log(`Total time: ${formatDuration(Date.now() - startedAt)}`);
   } catch (error) {
     console.error("DiskMind failed:", error instanceof Error ? error.message : error);
+    console.log(`Total time before failure: ${formatDuration(Date.now() - startedAt)}`);
     process.exitCode = 1;
   }
+}
+
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+
+  return `${seconds}s`;
 }
 
 async function askStartupOptions(): Promise<{ selectedDrive: string }> {

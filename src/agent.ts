@@ -23,6 +23,8 @@ export interface AgentOptions {
   rootSummaryDepth?: number;
   diveSummaryDepth?: number;
   topFilesLimit?: number;
+  topFileScanDepth?: number;
+  topFileScanMaxFiles?: number;
   roots?: string[];
 }
 
@@ -31,6 +33,8 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
   const rootSummaryDepth = options.rootSummaryDepth ?? 1;
   const diveSummaryDepth = options.diveSummaryDepth ?? 2;
   const topFilesLimit = options.topFilesLimit ?? 50;
+  const topFileScanDepth = options.topFileScanDepth ?? Number(process.env.DISKMIND_TOP_SCAN_DEPTH ?? 4);
+  const topFileScanMaxFiles = options.topFileScanMaxFiles ?? Number(process.env.DISKMIND_TOP_SCAN_MAX_FILES ?? 25000);
 
   const map = await loadMap();
   const visited = new Set<string>();
@@ -52,7 +56,13 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
 
     updateSnapshot(map, snapshot);
     mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
-    const rootTop = await listLargestFiles(root, Math.ceil(topFilesLimit / Math.max(1, roots.length)));
+    mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
+
+    // Perform one bounded deep scan per root for better global heavy-hitter detection.
+    const rootTop = await listLargestFiles(root, Math.ceil(topFilesLimit / Math.max(1, roots.length)), {
+      maxDepth: topFileScanDepth,
+      maxFilesVisited: topFileScanMaxFiles
+    });
     mergeTopFiles(map, rootTop, topFilesLimit);
     visited.add(root);
     await saveMap(map);
@@ -72,8 +82,7 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
 
     updateSnapshot(map, snapshot);
     mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
-    const localTopFiles = await listLargestFiles(currentPath, topFilesLimit);
-    mergeTopFiles(map, localTopFiles, topFilesLimit);
+    mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
     await saveMap(map);
 
     const decision = await decideNextAction({
@@ -101,6 +110,13 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
   });
 
   return writeReports(finalPlan, map.potentialSavings);
+}
+
+function pickTopFilesFromNodes(nodes: DiskNode[], limit: number): DiskNode[] {
+  return nodes
+    .filter((node) => !node.isDirectory)
+    .sort((a, b) => b.sizeGB - a.sizeGB)
+    .slice(0, limit);
 }
 
 function detectPotentialSavings(nodes: DiskNode[]): PotentialSaving[] {

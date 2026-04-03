@@ -5,7 +5,9 @@ import OpenAI from "openai";
 import { DiskNode } from "./scanner";
 import { PotentialSaving } from "./database";
 
-const LOG_PATH = path.join(process.cwd(), "logs", "llm-calls.log");
+const RUN_ID = new Date().toISOString().replace(/[.:]/g, "-");
+const LOG_DIR = path.join(process.cwd(), "logs");
+const LOG_PATH = path.join(LOG_DIR, `llm-calls-${RUN_ID}.log`);
 
 const DECISION_SCHEMA = {
   type: "object",
@@ -38,16 +40,20 @@ async function llmLog(entry: {
   prompt: string;
   raw: string;
   parseOk: boolean;
+  error?: string;
 }): Promise<void> {
   try {
-    await fs.ensureDir(path.dirname(LOG_PATH));
+    await fs.ensureDir(LOG_DIR);
+
     const line =
       JSON.stringify({
         ts: new Date().toISOString(),
+        runId: RUN_ID,
         call: entry.call,
         provider: entry.provider,
         model: entry.model,
         parseOk: entry.parseOk,
+        error: entry.error,
         prompt: entry.prompt,
         raw: entry.raw
       }) + "\n";
@@ -78,6 +84,16 @@ export interface OllamaInventory {
 
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const ollama = new Ollama({ host: process.env.OLLAMA_HOST });
+let ollamaRequestQueue: Promise<void> = Promise.resolve();
+
+async function runWithOllamaLock<T>(operation: () => Promise<T>): Promise<T> {
+  const run = ollamaRequestQueue.then(operation, operation);
+  ollamaRequestQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
 export async function getOllamaInventory(): Promise<OllamaInventory> {
   try {
@@ -138,21 +154,35 @@ export async function decideNextAction(input: {
     `Global top files: ${compactTopFiles}`
   ].join("\n");
 
-  const raw = await chat(prompt, DECISION_SCHEMA);
-  console.debug(`[DiskMind LLM] decideNextAction raw response (${raw.length} chars):`, raw.slice(0, 300));
-  const parsed = parseJson<AgentDecision>(raw);
-  const parseOk = parsed !== null && ["DELVE", "PLAN", "REPORT"].includes(parsed.action);
-  void llmLog({
-    call: "decideNextAction",
-    provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
-    model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
-    prompt,
-    raw,
-    parseOk
-  });
+  try {
+    const raw = await chat(prompt, DECISION_SCHEMA);
+    console.debug(`[DiskMind LLM] decideNextAction raw response (${raw.length} chars):`, raw.slice(0, 300));
+    const parsed = parseJson<AgentDecision>(raw);
+    const parseOk = parsed !== null && ["DELVE", "PLAN", "REPORT"].includes(parsed.action);
+    void llmLog({
+      call: "decideNextAction",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt,
+      raw,
+      parseOk
+    });
 
-  if (parseOk) {
-    return parsed;
+    if (parseOk) {
+      return parsed;
+    }
+  } catch (error) {
+    const message = getErrorMessage(error);
+    console.warn(`DiskMind LLM warning [decideNextAction]: ${message}`);
+    void llmLog({
+      call: "decideNextAction",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt,
+      raw: "",
+      parseOk: false,
+      error: message
+    });
   }
 
   const fallbackTarget = input.nodes.find((node) => node.isDirectory && !input.visitedPaths.includes(node.path));
@@ -203,27 +233,41 @@ export async function createFinalPlan(input: {
     `Top files: ${compactTopFiles}`
   ].join("\n");
 
-  const raw = await chat(prompt, FINAL_PLAN_SCHEMA);
-  console.debug(`[DiskMind LLM] createFinalPlan raw response (${raw.length} chars):`, raw.slice(0, 500));
-  const parsed = parseJson<FinalPlan>(raw);
-  const parseOk = isUsableFinalPlan(parsed);
-  void llmLog({
-    call: "createFinalPlan",
-    provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
-    model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
-    prompt,
-    raw,
-    parseOk
-  });
+  try {
+    const raw = await chat(prompt, FINAL_PLAN_SCHEMA);
+    console.debug(`[DiskMind LLM] createFinalPlan raw response (${raw.length} chars):`, raw.slice(0, 500));
+    const parsed = parseJson<FinalPlan>(raw);
+    const parseOk = isUsableFinalPlan(parsed);
+    void llmLog({
+      call: "createFinalPlan",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt,
+      raw,
+      parseOk
+    });
 
-  if (parsed && parseOk) {
-    return {
-      summary: parsed.summary ?? "No summary produced.",
-      zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
-      mediumRiskChecklist: Array.isArray(parsed.mediumRiskChecklist) ? parsed.mediumRiskChecklist : [],
-      highRiskChecklist: Array.isArray(parsed.highRiskChecklist) ? parsed.highRiskChecklist : [],
-      disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
-    };
+    if (parsed && parseOk) {
+      return {
+        summary: parsed.summary ?? "No summary produced.",
+        zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
+        mediumRiskChecklist: Array.isArray(parsed.mediumRiskChecklist) ? parsed.mediumRiskChecklist : [],
+        highRiskChecklist: Array.isArray(parsed.highRiskChecklist) ? parsed.highRiskChecklist : [],
+        disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
+      };
+    }
+  } catch (error) {
+    const message = getErrorMessage(error);
+    console.warn(`DiskMind LLM warning [createFinalPlan]: ${message}`);
+    void llmLog({
+      call: "createFinalPlan",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt,
+      raw: "",
+      parseOk: false,
+      error: message
+    });
   }
 
   return {
@@ -254,15 +298,17 @@ async function chat(prompt: string, jsonSchema?: object): Promise<string> {
     return completion.output_text;
   }
 
-  const response = await ollama.chat({
-    model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
-    messages: [
-      { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
-      { role: "user", content: prompt }
-    ],
-    format: jsonSchema ?? "json",
-    options: { temperature: 0.1 }
-  });
+  const response = await runWithOllamaLock(() =>
+    ollama.chat({
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
+      messages: [
+        { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
+        { role: "user", content: prompt }
+      ],
+      format: jsonSchema ?? "json",
+      options: { temperature: 0.1 }
+    })
+  );
 
   return response.message.content;
 }
@@ -379,6 +425,13 @@ function isUsableFinalPlan(plan: FinalPlan | null): boolean {
     Array.isArray(plan.highRiskChecklist) &&
     Array.isArray(plan.disclaimers)
   );
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }
 
 function extractFirstJsonObject(text: string): string | null {

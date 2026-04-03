@@ -19,6 +19,11 @@ export interface ScanOptions {
   fileLimitForTopScan?: number;
 }
 
+export interface LargestFilesOptions {
+  maxDepth?: number;
+  maxFilesVisited?: number;
+}
+
 export interface DirectorySnapshot {
   scannedPath: string;
   scannedAtISO: string;
@@ -72,8 +77,18 @@ export async function getDirectorySummary(dirPath: string, options: ScanOptions 
   };
 }
 
-export async function listLargestFiles(rootPath: string, limit = 50): Promise<DiskNode[]> {
+export async function listLargestFiles(
+  rootPath: string,
+  limit = 50,
+  options: LargestFilesOptions = {}
+): Promise<DiskNode[]> {
   const collected: DiskNode[] = [];
+  const state: WalkState = {
+    filesVisited: 0,
+    maxFilesVisited: options.maxFilesVisited,
+    stop: false
+  };
+
   await walkFiles(rootPath, async (filePath, stats) => {
     collected.push({
       path: filePath,
@@ -83,7 +98,7 @@ export async function listLargestFiles(rootPath: string, limit = 50): Promise<Di
       extension: path.extname(filePath).toLowerCase() || undefined,
       lastModifiedISO: stats.mtime.toISOString()
     });
-  });
+  }, options.maxDepth ?? Number.POSITIVE_INFINITY, state, 0);
 
   return collected.sort((a, b) => b.sizeGB - a.sizeGB).slice(0, limit);
 }
@@ -143,10 +158,23 @@ async function calculateFolderSize(dirPath: string, depth: number): Promise<numb
   return total;
 }
 
+interface WalkState {
+  filesVisited: number;
+  maxFilesVisited?: number;
+  stop: boolean;
+}
+
 async function walkFiles(
   rootPath: string,
-  onFile: (filePath: string, stats: fs.Stats) => Promise<void>
+  onFile: (filePath: string, stats: fs.Stats) => Promise<void>,
+  maxDepth: number,
+  state: WalkState,
+  depth: number
 ): Promise<void> {
+  if (state.stop || depth > maxDepth) {
+    return;
+  }
+
   let entries: string[] = [];
 
   try {
@@ -156,14 +184,23 @@ async function walkFiles(
   }
 
   for (const entry of entries) {
+    if (state.stop) {
+      return;
+    }
+
     const fullPath = path.join(rootPath, entry);
 
     try {
       const stats = await fs.stat(fullPath);
       if (stats.isDirectory()) {
-        await walkFiles(fullPath, onFile);
+        await walkFiles(fullPath, onFile, maxDepth, state, depth + 1);
       } else {
+        state.filesVisited += 1;
         await onFile(fullPath, stats);
+        if (state.maxFilesVisited && state.filesVisited >= state.maxFilesVisited) {
+          state.stop = true;
+          return;
+        }
       }
     } catch {
       continue;
