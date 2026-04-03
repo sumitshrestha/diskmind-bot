@@ -8,6 +8,22 @@ import { PotentialSaving } from "./database";
 const RUN_ID = new Date().toISOString().replace(/[.:]/g, "-");
 const LOG_DIR = path.join(process.cwd(), "logs");
 const LOG_PATH = path.join(LOG_DIR, `llm-calls-${RUN_ID}.log`);
+const OLLAMA_MAX_RETRIES = Number(process.env.DISKMIND_OLLAMA_RETRIES ?? 2);
+const OLLAMA_RETRY_DELAY_MS = Number(process.env.DISKMIND_OLLAMA_RETRY_DELAY_MS ?? 2000);
+
+interface PromptBudget {
+  decisionNodeLimit: number;
+  decisionTopFilesLimit: number;
+  planSavingsLimit: number;
+  planTopFilesLimit: number;
+}
+
+const DEFAULT_PROMPT_BUDGET: PromptBudget = {
+  decisionNodeLimit: 35,
+  decisionTopFilesLimit: 20,
+  planSavingsLimit: 120,
+  planTopFilesLimit: 40
+};
 
 const DECISION_SCHEMA = {
   type: "object",
@@ -85,6 +101,7 @@ export interface OllamaInventory {
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const ollama = new Ollama({ host: process.env.OLLAMA_HOST });
 let ollamaRequestQueue: Promise<void> = Promise.resolve();
+let promptBudgetCache: Promise<PromptBudget> | null = null;
 
 async function runWithOllamaLock<T>(operation: () => Promise<T>): Promise<T> {
   const run = ollamaRequestQueue.then(operation, operation);
@@ -130,8 +147,9 @@ export async function decideNextAction(input: {
   topFiles: DiskNode[];
   visitedPaths: string[];
 }): Promise<AgentDecision> {
-  const compactNodes = summarizeNodes(input.nodes, 35);
-  const compactTopFiles = summarizeNodes(input.topFiles, 20);
+  const budget = await getPromptBudget();
+  const compactNodes = summarizeNodes(input.nodes, budget.decisionNodeLimit);
+  const compactTopFiles = summarizeNodes(input.topFiles, budget.decisionTopFilesLimit);
   const prompt = [
     "You are DiskMind's decision engine.",
     "Choose one action:",
@@ -205,8 +223,10 @@ export async function createFinalPlan(input: {
   topFiles: DiskNode[];
   scannedPaths: string[];
 }): Promise<FinalPlan> {
-  const compactSavings = summarizeSavings(input.potentialSavings, 120);
-  const compactTopFiles = summarizeNodes(input.topFiles, 40);
+  let failureReason: string | null = null;
+  const budget = await getPromptBudget();
+  const compactSavings = summarizeSavings(input.potentialSavings, budget.planSavingsLimit);
+  const compactTopFiles = summarizeNodes(input.topFiles, budget.planTopFilesLimit);
   const prompt = [
     "You are DiskMind's cleanup strategist.",
     "Analyze the potential savings and classify each item by risk.",
@@ -258,6 +278,7 @@ export async function createFinalPlan(input: {
     }
   } catch (error) {
     const message = getErrorMessage(error);
+    failureReason = message;
     console.warn(`DiskMind LLM warning [createFinalPlan]: ${message}`);
     void llmLog({
       call: "createFinalPlan",
@@ -270,12 +291,20 @@ export async function createFinalPlan(input: {
     });
   }
 
+  const unavailable = failureReason && isLikelyTransportFailure(failureReason);
+
   return {
-    summary: "Model response could not be parsed. Manual review required.",
+    summary: unavailable
+      ? "LLM request failed (likely local Ollama availability/timeout). Manual review required."
+      : "Model response could not be parsed. Manual review required.",
     zeroRiskPowershell: "# Manual script creation required",
     mediumRiskChecklist: ["Review large unused applications."],
     highRiskChecklist: ["Inspect personal media and project folders manually."],
-    disclaimers: ["LLM output parsing failed; no automated recommendations trusted."]
+    disclaimers: [
+      unavailable
+        ? `LLM request failed: ${failureReason}; no automated recommendations trusted.`
+        : "LLM output parsing failed; no automated recommendations trusted."
+    ]
   };
 }
 
@@ -298,19 +327,42 @@ async function chat(prompt: string, jsonSchema?: object): Promise<string> {
     return completion.output_text;
   }
 
-  const response = await runWithOllamaLock(() =>
-    ollama.chat({
-      model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
-      messages: [
-        { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
-        { role: "user", content: prompt }
-      ],
-      format: jsonSchema ?? "json",
-      options: { temperature: 0.1 }
-    })
-  );
+  const model = process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b";
+  let lastError: unknown = null;
 
-  return response.message.content;
+  for (let attempt = 0; attempt <= OLLAMA_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await runWithOllamaLock(() =>
+        ollama.chat({
+          model,
+          messages: [
+            { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
+            { role: "user", content: prompt }
+          ],
+          format: jsonSchema ?? "json",
+          options: { temperature: 0.1 }
+        })
+      );
+
+      return response.message.content;
+    } catch (error) {
+      lastError = error;
+      const message = getErrorMessage(error);
+      const canRetry = attempt < OLLAMA_MAX_RETRIES && isLikelyTransportFailure(message);
+
+      if (!canRetry) {
+        throw error;
+      }
+
+      const waitMs = OLLAMA_RETRY_DELAY_MS * (attempt + 1);
+      console.warn(
+        `DiskMind LLM transient failure on model ${model}; retrying (${attempt + 1}/${OLLAMA_MAX_RETRIES}) in ${waitMs}ms: ${message}`
+      );
+      await delay(waitMs);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(getErrorMessage(lastError));
 }
 
 function parseJson<T>(raw: string): T | null {
@@ -432,6 +484,148 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function isLikelyTransportFailure(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("fetch failed") ||
+    lower.includes("econn") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("socket") ||
+    lower.includes("network") ||
+    lower.includes("connection")
+  );
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function getPromptBudget(): Promise<PromptBudget> {
+  if (!promptBudgetCache) {
+    promptBudgetCache = resolvePromptBudget();
+  }
+
+  return promptBudgetCache;
+}
+
+async function resolvePromptBudget(): Promise<PromptBudget> {
+  const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
+  if (provider !== "ollama") {
+    return DEFAULT_PROMPT_BUDGET;
+  }
+
+  const envVram = Number(process.env.DISKMIND_OLLAMA_VRAM_GB ?? "");
+  if (Number.isFinite(envVram) && envVram > 0) {
+    return budgetFromVramGb(envVram);
+  }
+
+  const detected = await detectOllamaVramGb();
+  if (!detected) {
+    return DEFAULT_PROMPT_BUDGET;
+  }
+
+  return budgetFromVramGb(detected);
+}
+
+async function detectOllamaVramGb(): Promise<number | null> {
+  try {
+    const psResponse = await ollama.ps();
+    const models = ((psResponse as unknown as { models?: Array<Record<string, unknown>> }).models ?? []);
+    if (models.length === 0) {
+      return null;
+    }
+
+    const bytes = models
+      .map((model) => parseVramBytes(model.size_vram))
+      .filter((value): value is number => value !== null)
+      .reduce((sum, value) => sum + value, 0);
+
+    if (bytes <= 0) {
+      return null;
+    }
+
+    return bytes / 1024 / 1024 / 1024;
+  } catch {
+    return null;
+  }
+}
+
+function parseVramBytes(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const direct = Number(value);
+  if (Number.isFinite(direct) && direct > 0) {
+    return direct;
+  }
+
+  const match = value.trim().toUpperCase().match(/^([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB)$/);
+  if (!match) {
+    return null;
+  }
+
+  const amount = Number(match[1]);
+  const unit = match[2];
+  const multiplier =
+    unit === "TB"
+      ? 1024 ** 4
+      : unit === "GB"
+        ? 1024 ** 3
+        : unit === "MB"
+          ? 1024 ** 2
+          : unit === "KB"
+            ? 1024
+            : 1;
+
+  return amount * multiplier;
+}
+
+function budgetFromVramGb(vramGb: number): PromptBudget {
+  if (vramGb >= 40) {
+    return {
+      decisionNodeLimit: 120,
+      decisionTopFilesLimit: 80,
+      planSavingsLimit: 420,
+      planTopFilesLimit: 180
+    };
+  }
+
+  if (vramGb >= 24) {
+    return {
+      decisionNodeLimit: 90,
+      decisionTopFilesLimit: 60,
+      planSavingsLimit: 320,
+      planTopFilesLimit: 130
+    };
+  }
+
+  if (vramGb >= 16) {
+    return {
+      decisionNodeLimit: 70,
+      decisionTopFilesLimit: 45,
+      planSavingsLimit: 240,
+      planTopFilesLimit: 95
+    };
+  }
+
+  if (vramGb >= 10) {
+    return {
+      decisionNodeLimit: 50,
+      decisionTopFilesLimit: 30,
+      planSavingsLimit: 170,
+      planTopFilesLimit: 60
+    };
+  }
+
+  return DEFAULT_PROMPT_BUDGET;
 }
 
 function extractFirstJsonObject(text: string): string | null {

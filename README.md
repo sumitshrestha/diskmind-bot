@@ -60,6 +60,10 @@ DISKMIND_LLM_PROVIDER=ollama
 # Ollama options
 DISKMIND_OLLAMA_MODEL=llama3.1:8b
 # OLLAMA_HOST=http://localhost:11434
+DISKMIND_OLLAMA_RETRIES=2
+DISKMIND_OLLAMA_RETRY_DELAY_MS=2000
+# Optional VRAM override (GB) to scale prompt payload size, e.g. 16, 24, 48
+# DISKMIND_OLLAMA_VRAM_GB=16
 
 # OpenAI options (used only if provider=openai)
 # OPENAI_API_KEY=your_key
