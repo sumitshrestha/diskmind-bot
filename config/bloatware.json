@@ -1,0 +1,22 @@
+{
+  "knownPatterns": [
+    "AppData/Local/Temp",
+    "AppData/Local/Microsoft/Windows/INetCache",
+    "AppData/Local/CrashDumps",
+    "Windows/Temp",
+    "Windows/SoftwareDistribution/Download",
+    "$Recycle.Bin",
+    "node_modules/.cache",
+    "npm-cache",
+    ".nuget/packages",
+    "pip/cache",
+    "Ollama/models"
+  ],
+  "extensionsLowRisk": [
+    ".tmp",
+    ".log",
+    ".bak",
+    ".old",
+    ".dmp"
+  ]
+}
