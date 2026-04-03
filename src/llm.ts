@@ -1,7 +1,37 @@
+import * as fs from "fs-extra";
+import * as path from "path";
 import { Ollama } from "ollama";
 import OpenAI from "openai";
 import { DiskNode } from "./scanner";
 import { PotentialSaving } from "./database";
+
+const LOG_PATH = path.join(process.cwd(), "logs", "llm-calls.log");
+
+async function llmLog(entry: {
+  call: string;
+  provider: string;
+  model: string;
+  prompt: string;
+  raw: string;
+  parseOk: boolean;
+}): Promise<void> {
+  try {
+    await fs.ensureDir(path.dirname(LOG_PATH));
+    const line =
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        call: entry.call,
+        provider: entry.provider,
+        model: entry.model,
+        parseOk: entry.parseOk,
+        prompt: entry.prompt,
+        raw: entry.raw
+      }) + "\n";
+    await fs.appendFile(LOG_PATH, line, "utf8");
+  } catch {
+    // Non-fatal — never let logging break the main flow.
+  }
+}
 
 export interface AgentDecision {
   action: "DELVE" | "PLAN" | "REPORT";
@@ -66,8 +96,11 @@ export async function decideNextAction(input: {
     "- DELVE: continue scanning a folder",
     "- PLAN: enough data to propose cleanup",
     "- REPORT: stop and summarize current findings",
-    "Output strict JSON only:",
-    '{"action":"DELVE|PLAN|REPORT","target":"optional_path","reasoning":"short text"}',
+    "Respond with ONLY a single JSON object. No explanation, no markdown, no extra text.",
+    "Use exactly this structure:",
+    '{"action":"DELVE","target":"C:\\\\SomeFolder","reasoning":"short text"}',
+    "The action field must be exactly one of: DELVE, PLAN, REPORT",
+    "The target field is only required for DELVE.",
     "Rules:",
     "- Prefer DELVE into the largest unvisited directory.",
     "- Do not DELVE into protected system internals unless obviously huge.",
@@ -79,9 +112,19 @@ export async function decideNextAction(input: {
   ].join("\n");
 
   const raw = await chat(prompt);
+  console.debug(`[DiskMind LLM] decideNextAction raw response (${raw.length} chars):`, raw.slice(0, 300));
   const parsed = parseJson<AgentDecision>(raw);
+  const parseOk = parsed !== null && ["DELVE", "PLAN", "REPORT"].includes(parsed.action);
+  void llmLog({
+    call: "decideNextAction",
+    provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+    model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+    prompt,
+    raw,
+    parseOk
+  });
 
-  if (parsed && ["DELVE", "PLAN", "REPORT"].includes(parsed.action)) {
+  if (parseOk) {
     return parsed;
   }
 
@@ -107,24 +150,41 @@ export async function createFinalPlan(input: {
 }): Promise<FinalPlan> {
   const prompt = [
     "You are DiskMind's cleanup strategist.",
-    "Analyze potential deletions and classify risk.",
+    "Analyze the potential savings and classify each item by risk.",
     "Risk buckets:",
-    "- Zero Risk: Caches, Temp files, Prefetch, logs safe to clear",
+    "- Zero Risk: Caches, Temp files, Prefetch, logs safe to clear automatically",
     "- Medium Risk: old apps, duplicate AI models, stale SDK caches",
     "- High Risk/User Action: personal media, project folders, unknown binaries",
-    "Return strict JSON only with keys:",
-    "summary, zeroRiskPowershell, mediumRiskChecklist, highRiskChecklist, disclaimers",
+    "Respond with ONLY a single JSON object. No explanation, no markdown, no extra text.",
+    "Use exactly this structure (all fields are required):",
+    JSON.stringify({
+      summary: "One paragraph describing what was found and top recommendations.",
+      zeroRiskPowershell: "# PowerShell script\nRemove-Item -Path 'C:\\Windows\\Temp\\*' -Recurse -Force -WhatIf",
+      mediumRiskChecklist: ["Example: Review large unused app at C:\\SomePath"],
+      highRiskChecklist: ["Example: Inspect personal folder at C:\\Users\\Name"],
+      disclaimers: ["Always review the script before running it."]
+    }),
     "Rules for zeroRiskPowershell:",
-    "- Readable, commented, idempotent",
-    "- Must only remove obvious cache/temp/log paths",
-    "- Include -WhatIf in Remove-Item examples",
+    "- Readable, commented, idempotent PowerShell",
+    "- Must only remove obvious cache/temp/log paths from the potential savings list",
+    "- Include -WhatIf in all Remove-Item calls",
+    "- Include a comment above each Remove-Item explaining what it removes",
     `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
     `Potential savings: ${JSON.stringify(input.potentialSavings.slice(0, 500))}`,
     `Top files: ${JSON.stringify(input.topFiles.slice(0, 100))}`
   ].join("\n");
 
   const raw = await chat(prompt);
+  console.debug(`[DiskMind LLM] createFinalPlan raw response (${raw.length} chars):`, raw.slice(0, 500));
   const parsed = parseJson<FinalPlan>(raw);
+  void llmLog({
+    call: "createFinalPlan",
+    provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+    model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+    prompt,
+    raw,
+    parseOk: parsed !== null
+  });
 
   if (parsed) {
     return {
