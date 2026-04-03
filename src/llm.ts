@@ -7,6 +7,30 @@ import { PotentialSaving } from "./database";
 
 const LOG_PATH = path.join(process.cwd(), "logs", "llm-calls.log");
 
+const DECISION_SCHEMA = {
+  type: "object",
+  required: ["action", "reasoning"],
+  properties: {
+    action: { type: "string", enum: ["DELVE", "PLAN", "REPORT"] },
+    target: { type: "string" },
+    reasoning: { type: "string" }
+  },
+  additionalProperties: false
+} as const;
+
+const FINAL_PLAN_SCHEMA = {
+  type: "object",
+  required: ["summary", "zeroRiskPowershell", "mediumRiskChecklist", "highRiskChecklist", "disclaimers"],
+  properties: {
+    summary: { type: "string" },
+    zeroRiskPowershell: { type: "string" },
+    mediumRiskChecklist: { type: "array", items: { type: "string" } },
+    highRiskChecklist: { type: "array", items: { type: "string" } },
+    disclaimers: { type: "array", items: { type: "string" } }
+  },
+  additionalProperties: false
+} as const;
+
 async function llmLog(entry: {
   call: string;
   provider: string;
@@ -90,6 +114,8 @@ export async function decideNextAction(input: {
   topFiles: DiskNode[];
   visitedPaths: string[];
 }): Promise<AgentDecision> {
+  const compactNodes = summarizeNodes(input.nodes, 35);
+  const compactTopFiles = summarizeNodes(input.topFiles, 20);
   const prompt = [
     "You are DiskMind's decision engine.",
     "Choose one action:",
@@ -105,13 +131,14 @@ export async function decideNextAction(input: {
     "- Prefer DELVE into the largest unvisited directory.",
     "- Do not DELVE into protected system internals unless obviously huge.",
     "- If confidence is low, choose PLAN.",
+    "- DELVE only if target is a directory path.",
     `Current path: ${input.currentPath}`,
     `Visited paths: ${JSON.stringify(input.visitedPaths)}`,
-    `Current summary (largest first): ${JSON.stringify(input.nodes.slice(0, 60))}`,
-    `Global top files: ${JSON.stringify(input.topFiles.slice(0, 50))}`
+    `Current summary (largest first): ${compactNodes}`,
+    `Global top files: ${compactTopFiles}`
   ].join("\n");
 
-  const raw = await chat(prompt);
+  const raw = await chat(prompt, DECISION_SCHEMA);
   console.debug(`[DiskMind LLM] decideNextAction raw response (${raw.length} chars):`, raw.slice(0, 300));
   const parsed = parseJson<AgentDecision>(raw);
   const parseOk = parsed !== null && ["DELVE", "PLAN", "REPORT"].includes(parsed.action);
@@ -148,6 +175,8 @@ export async function createFinalPlan(input: {
   topFiles: DiskNode[];
   scannedPaths: string[];
 }): Promise<FinalPlan> {
+  const compactSavings = summarizeSavings(input.potentialSavings, 120);
+  const compactTopFiles = summarizeNodes(input.topFiles, 40);
   const prompt = [
     "You are DiskMind's cleanup strategist.",
     "Analyze the potential savings and classify each item by risk.",
@@ -170,23 +199,24 @@ export async function createFinalPlan(input: {
     "- Include -WhatIf in all Remove-Item calls",
     "- Include a comment above each Remove-Item explaining what it removes",
     `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
-    `Potential savings: ${JSON.stringify(input.potentialSavings.slice(0, 500))}`,
-    `Top files: ${JSON.stringify(input.topFiles.slice(0, 100))}`
+    `Potential savings: ${compactSavings}`,
+    `Top files: ${compactTopFiles}`
   ].join("\n");
 
-  const raw = await chat(prompt);
+  const raw = await chat(prompt, FINAL_PLAN_SCHEMA);
   console.debug(`[DiskMind LLM] createFinalPlan raw response (${raw.length} chars):`, raw.slice(0, 500));
   const parsed = parseJson<FinalPlan>(raw);
+  const parseOk = isUsableFinalPlan(parsed);
   void llmLog({
     call: "createFinalPlan",
     provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
     model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
     prompt,
     raw,
-    parseOk: parsed !== null
+    parseOk
   });
 
-  if (parsed) {
+  if (parsed && parseOk) {
     return {
       summary: parsed.summary ?? "No summary produced.",
       zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
@@ -205,7 +235,7 @@ export async function createFinalPlan(input: {
   };
 }
 
-async function chat(prompt: string): Promise<string> {
+async function chat(prompt: string, jsonSchema?: object): Promise<string> {
   const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
 
   if (provider === "openai") {
@@ -226,8 +256,11 @@ async function chat(prompt: string): Promise<string> {
 
   const response = await ollama.chat({
     model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
-    messages: [{ role: "user", content: prompt }],
-    format: "json",
+    messages: [
+      { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
+      { role: "user", content: prompt }
+    ],
+    format: jsonSchema ?? "json",
     options: { temperature: 0.1 }
   });
 
@@ -235,21 +268,36 @@ async function chat(prompt: string): Promise<string> {
 }
 
 function parseJson<T>(raw: string): T | null {
+  return parseJsonInternal<T>(raw, 0);
+}
+
+function parseJsonInternal<T>(raw: string, depth: number): T | null {
   const trimmed = raw.trim();
   if (!trimmed) {
+    return null;
+  }
+  if (depth > 3) {
     return null;
   }
 
   // Some local models prepend chain-of-thought style tags before JSON.
   const withoutThinkingBlocks = trimmed.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-  const direct = tryParseJson<T>(withoutThinkingBlocks);
-  if (direct) {
-    return direct;
+  const direct = tryParseJsonUnknown(withoutThinkingBlocks);
+  if (direct !== null) {
+    const unwrapped = unwrapEnvelopeContent(direct);
+    if (unwrapped && unwrapped !== withoutThinkingBlocks) {
+      const nested = parseJsonInternal<T>(unwrapped, depth + 1);
+      if (nested) {
+        return nested;
+      }
+    }
+
+    return direct as T;
   }
 
   const fenced = withoutThinkingBlocks.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) {
-    const fencedParsed = tryParseJson<T>(fenced[1].trim());
+    const fencedParsed = parseJsonInternal<T>(fenced[1].trim(), depth + 1);
     if (fencedParsed) {
       return fencedParsed;
     }
@@ -260,7 +308,7 @@ function parseJson<T>(raw: string): T | null {
     return null;
   }
 
-  return tryParseJson<T>(extracted);
+  return parseJsonInternal<T>(extracted, depth + 1);
 }
 
 function tryParseJson<T>(text: string): T | null {
@@ -269,6 +317,68 @@ function tryParseJson<T>(text: string): T | null {
   } catch {
     return null;
   }
+}
+
+function tryParseJsonUnknown(text: string): unknown | null {
+  return tryParseJson<unknown>(text);
+}
+
+function unwrapEnvelopeContent(value: unknown): string | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const contentCandidate = obj.content ?? obj.response ?? obj.text;
+  if (typeof contentCandidate === "string") {
+    return contentCandidate;
+  }
+
+  const messageCandidate = obj.message;
+  if (messageCandidate && typeof messageCandidate === "object") {
+    const nested = (messageCandidate as Record<string, unknown>).content;
+    if (typeof nested === "string") {
+      return nested;
+    }
+  }
+
+  return null;
+}
+
+function summarizeNodes(nodes: DiskNode[], limit: number): string {
+  return JSON.stringify(
+    nodes.slice(0, limit).map((node) => ({
+      path: node.path,
+      sizeGB: node.sizeGB,
+      isDirectory: node.isDirectory,
+      extension: node.extension
+    }))
+  );
+}
+
+function summarizeSavings(savings: PotentialSaving[], limit: number): string {
+  return JSON.stringify(
+    savings.slice(0, limit).map((saving) => ({
+      path: saving.path,
+      sizeGB: saving.sizeGB,
+      reason: saving.reason,
+      riskHint: saving.riskHint
+    }))
+  );
+}
+
+function isUsableFinalPlan(plan: FinalPlan | null): boolean {
+  if (!plan) {
+    return false;
+  }
+
+  return (
+    typeof plan.summary === "string" &&
+    typeof plan.zeroRiskPowershell === "string" &&
+    Array.isArray(plan.mediumRiskChecklist) &&
+    Array.isArray(plan.highRiskChecklist) &&
+    Array.isArray(plan.disclaimers)
+  );
 }
 
 function extractFirstJsonObject(text: string): string | null {
