@@ -23,6 +23,7 @@ export interface AgentOptions {
   rootSummaryDepth?: number;
   diveSummaryDepth?: number;
   topFilesLimit?: number;
+  roots?: string[];
 }
 
 export async function startAnalysis(options: AgentOptions = {}): Promise<{ reportPath: string; scriptPath: string }> {
@@ -34,7 +35,8 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
   const map = await loadMap();
   const visited = new Set<string>();
 
-  const roots = await getExistingRoots(getDefaultRoots());
+  const rootCandidates = options.roots && options.roots.length > 0 ? options.roots : getDefaultRoots();
+  const roots = await getExistingRoots(rootCandidates);
   if (roots.length === 0) {
     throw new Error("No readable roots found. Set DISKMIND_ROOTS to one or more accessible paths.");
   }

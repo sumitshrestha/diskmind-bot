@@ -17,9 +17,6 @@ export interface FinalPlan {
   disclaimers: string[];
 }
 
-const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
-const ollamaModel = process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b";
-const openaiModel = process.env.DISKMIND_OPENAI_MODEL ?? "gpt-4o-mini";
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const ollama = new Ollama({ host: process.env.OLLAMA_HOST });
 
@@ -115,7 +112,11 @@ export async function createFinalPlan(input: {
 }
 
 async function chat(prompt: string): Promise<string> {
+  const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
+
   if (provider === "openai") {
+    const openaiModel = process.env.DISKMIND_OPENAI_MODEL ?? "gpt-4o-mini";
+
     if (!openai) {
       throw new Error("OPENAI_API_KEY is required for provider=openai");
     }
@@ -130,7 +131,7 @@ async function chat(prompt: string): Promise<string> {
   }
 
   const response = await ollama.chat({
-    model: ollamaModel,
+    model: process.env.DISKMIND_OLLAMA_MODEL ?? "llama3.1:8b",
     messages: [{ role: "user", content: prompt }],
     options: { temperature: 0.1 }
   });
