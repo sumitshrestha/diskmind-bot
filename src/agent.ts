@@ -145,6 +145,7 @@ async function writeReports(
     zeroRiskPowershell: string;
     mediumRiskChecklist: string[];
     highRiskChecklist: string[];
+    offloadChecklist: string[];
     disclaimers: string[];
   },
   potentialSavings: PotentialSaving[]
@@ -171,6 +172,9 @@ async function writeReports(
     "",
     "High Risk / User Action Checklist",
     ...finalPlan.highRiskChecklist.map((item) => `- ${item}`),
+    "",
+    "Offload Candidates (External Storage)",
+    ...finalPlan.offloadChecklist.map((item) => `- ${item}`),
     "",
     "Disclaimers",
     ...finalPlan.disclaimers.map((item) => `- ${item}`),

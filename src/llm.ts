@@ -38,12 +38,13 @@ const DECISION_SCHEMA = {
 
 const FINAL_PLAN_SCHEMA = {
   type: "object",
-  required: ["summary", "zeroRiskPowershell", "mediumRiskChecklist", "highRiskChecklist", "disclaimers"],
+  required: ["summary", "zeroRiskPowershell", "mediumRiskChecklist", "highRiskChecklist", "offloadChecklist", "disclaimers"],
   properties: {
     summary: { type: "string" },
     zeroRiskPowershell: { type: "string" },
     mediumRiskChecklist: { type: "array", items: { type: "string" } },
     highRiskChecklist: { type: "array", items: { type: "string" } },
+    offloadChecklist: { type: "array", items: { type: "string" } },
     disclaimers: { type: "array", items: { type: "string" } }
   },
   additionalProperties: false
@@ -90,6 +91,7 @@ export interface FinalPlan {
   zeroRiskPowershell: string;
   mediumRiskChecklist: string[];
   highRiskChecklist: string[];
+  offloadChecklist: string[];
   disclaimers: string[];
 }
 
@@ -229,18 +231,20 @@ export async function createFinalPlan(input: {
   const compactTopFiles = summarizeNodes(input.topFiles, budget.planTopFilesLimit);
   const prompt = [
     "You are DiskMind's cleanup strategist.",
-    "Analyze the potential savings and classify each item by risk.",
+    "Analyze the potential savings and classify each item by risk and retention value.",
     "Risk buckets:",
     "- Zero Risk: Caches, Temp files, Prefetch, logs safe to clear automatically",
     "- Medium Risk: old apps, duplicate AI models, stale SDK caches",
     "- High Risk/User Action: personal media, project folders, unknown binaries",
+    "- Offload Candidates: large low-access files better moved to external storage, NAS, or cloud",
     "Respond with ONLY a single JSON object. No explanation, no markdown, no extra text.",
     "Use exactly this structure (all fields are required):",
     JSON.stringify({
       summary: "One paragraph describing what was found and top recommendations.",
       zeroRiskPowershell: "# PowerShell script\nRemove-Item -Path 'C:\\Windows\\Temp\\*' -Recurse -Force -WhatIf",
-      mediumRiskChecklist: ["Example: Review large unused app at C:\\SomePath"],
-      highRiskChecklist: ["Example: Inspect personal folder at C:\\Users\\Name"],
+      mediumRiskChecklist: ["Example: Review large unused app at C:\\SomePath and list top files"],
+      highRiskChecklist: ["Example: Inspect personal folder at C:\\Users\\Name before deleting anything"],
+      offloadChecklist: ["Example: Move C:\\Users\\Name\\Videos\\LargeFile.mp4 (last accessed 2023-08-01) to external drive"],
       disclaimers: ["Always review the script before running it."]
     }),
     "Rules for zeroRiskPowershell:",
@@ -248,6 +252,10 @@ export async function createFinalPlan(input: {
     "- Must only remove obvious cache/temp/log paths from the potential savings list",
     "- Include -WhatIf in all Remove-Item calls",
     "- Include a comment above each Remove-Item explaining what it removes",
+    "Rules for checklists:",
+    "- Every checklist item must include one or more concrete file/folder paths from the input.",
+    "- Use lastAccessedISO to prioritize stale files for offload (older access date = higher offload priority).",
+    "- Do not output placeholders, truncation markers, or incomplete paths.",
     `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
     `Potential savings: ${compactSavings}`,
     `Top files: ${compactTopFiles}`
@@ -268,11 +276,16 @@ export async function createFinalPlan(input: {
     });
 
     if (parsed && parseOk) {
+      const mediumRiskChecklist = sanitizeChecklist(parsed.mediumRiskChecklist);
+      const highRiskChecklist = sanitizeChecklist(parsed.highRiskChecklist);
+      const offloadChecklist = sanitizeChecklist(parsed.offloadChecklist);
+
       return {
         summary: parsed.summary ?? "No summary produced.",
         zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
-        mediumRiskChecklist: Array.isArray(parsed.mediumRiskChecklist) ? parsed.mediumRiskChecklist : [],
-        highRiskChecklist: Array.isArray(parsed.highRiskChecklist) ? parsed.highRiskChecklist : [],
+        mediumRiskChecklist,
+        highRiskChecklist,
+        offloadChecklist,
         disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
       };
     }
@@ -300,6 +313,7 @@ export async function createFinalPlan(input: {
     zeroRiskPowershell: "# Manual script creation required",
     mediumRiskChecklist: ["Review large unused applications."],
     highRiskChecklist: ["Inspect personal media and project folders manually."],
+    offloadChecklist: buildFallbackOffloadChecklist(input.topFiles),
     disclaimers: [
       unavailable
         ? `LLM request failed: ${failureReason}; no automated recommendations trusted.`
@@ -449,7 +463,9 @@ function summarizeNodes(nodes: DiskNode[], limit: number): string {
       path: node.path,
       sizeGB: node.sizeGB,
       isDirectory: node.isDirectory,
-      extension: node.extension
+      extension: node.extension,
+      lastAccessedISO: node.lastAccessedISO,
+      lastModifiedISO: node.lastModifiedISO
     }))
   );
 }
@@ -475,8 +491,48 @@ function isUsableFinalPlan(plan: FinalPlan | null): boolean {
     typeof plan.zeroRiskPowershell === "string" &&
     Array.isArray(plan.mediumRiskChecklist) &&
     Array.isArray(plan.highRiskChecklist) &&
+    Array.isArray(plan.offloadChecklist) &&
     Array.isArray(plan.disclaimers)
   );
+}
+
+function sanitizeChecklist(items: string[]): string[] {
+  const output: string[] = [];
+
+  for (const item of items) {
+    if (typeof item !== "string") {
+      continue;
+    }
+
+    const normalized = item.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      continue;
+    }
+
+    const lower = normalized.toLowerCase();
+    const looksTruncated =
+      lower.includes("truncated") ||
+      normalized.endsWith("...") ||
+      /[A-Za-z]:\\[^ ]{0,3}$/.test(normalized);
+
+    if (looksTruncated) {
+      continue;
+    }
+
+    output.push(normalized);
+  }
+
+  return output.slice(0, 20);
+}
+
+function buildFallbackOffloadChecklist(topFiles: DiskNode[]): string[] {
+  return topFiles
+    .filter((file) => !file.isDirectory)
+    .slice(0, 8)
+    .map((file) => {
+      const access = file.lastAccessedISO ? ` last accessed ${file.lastAccessedISO}` : " last access unknown";
+      return `Consider offloading ${file.path} (${file.sizeGB.toFixed(3)} GB,${access}) to external storage.`;
+    });
 }
 
 function getErrorMessage(error: unknown): string {

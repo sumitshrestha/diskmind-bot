@@ -10,6 +10,7 @@ export interface DiskNode {
   isDirectory: boolean;
   extension?: string;
   lastModifiedISO?: string;
+  lastAccessedISO?: string;
 }
 
 export interface ScanOptions {
@@ -63,7 +64,8 @@ export async function getDirectorySummary(dirPath: string, options: ScanOptions 
         sizeGB: Number((sizeBytes / BYTES_PER_GB).toFixed(3)),
         isDirectory,
         extension: isDirectory ? undefined : path.extname(entry).toLowerCase() || undefined,
-        lastModifiedISO: stats.mtime.toISOString()
+        lastModifiedISO: stats.mtime.toISOString(),
+        lastAccessedISO: stats.atime.toISOString()
       };
     } catch {
       return null;
@@ -96,7 +98,8 @@ export async function listLargestFiles(
       sizeGB: Number((stats.size / BYTES_PER_GB).toFixed(3)),
       isDirectory: false,
       extension: path.extname(filePath).toLowerCase() || undefined,
-      lastModifiedISO: stats.mtime.toISOString()
+      lastModifiedISO: stats.mtime.toISOString(),
+      lastAccessedISO: stats.atime.toISOString()
     });
   }, options.maxDepth ?? Number.POSITIVE_INFINITY, state, 0);
 
