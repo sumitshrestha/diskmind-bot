@@ -19,16 +19,20 @@ export interface DiskMindMap {
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_PATH = path.join(DATA_DIR, "diskmind-map.json");
 
+function createEmptyMap(): DiskMindMap {
+  return {
+    scannedPaths: {},
+    potentialSavings: [],
+    topFiles: [],
+    updatedAtISO: new Date().toISOString()
+  };
+}
+
 export async function loadMap(): Promise<DiskMindMap> {
   await fs.ensureDir(DATA_DIR);
 
   if (!(await fs.pathExists(DB_PATH))) {
-    const initial: DiskMindMap = {
-      scannedPaths: {},
-      potentialSavings: [],
-      topFiles: [],
-      updatedAtISO: new Date().toISOString()
-    };
+    const initial = createEmptyMap();
     await fs.writeJson(DB_PATH, initial, { spaces: 2 });
     return initial;
   }
@@ -89,4 +93,27 @@ export function mergeTopFiles(map: DiskMindMap, files: DiskNode[], limit = 50): 
 
 export function getDatabasePath(): string {
   return DB_PATH;
+}
+
+export async function prepareMapForRun(map: DiskMindMap): Promise<DiskMindMap> {
+  const existingTopFileChecks = await Promise.all(
+    map.topFiles.map(async (file) => ({
+      file,
+      exists: await fs.pathExists(file.path)
+    }))
+  );
+
+  const existingSavingChecks = await Promise.all(
+    map.potentialSavings.map(async (saving) => ({
+      saving,
+      exists: await fs.pathExists(saving.path)
+    }))
+  );
+
+  return {
+    scannedPaths: {},
+    topFiles: existingTopFileChecks.filter((item) => item.exists).map((item) => item.file),
+    potentialSavings: existingSavingChecks.filter((item) => item.exists).map((item) => item.saving),
+    updatedAtISO: new Date().toISOString()
+  };
 }

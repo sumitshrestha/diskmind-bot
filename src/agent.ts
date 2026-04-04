@@ -10,6 +10,7 @@ import {
 } from "./scanner";
 import {
   loadMap,
+  prepareMapForRun,
   saveMap,
   updateSnapshot,
   mergePotentialSavings,
@@ -36,7 +37,7 @@ export async function startAnalysis(options: AgentOptions = {}): Promise<{ repor
   const topFileScanDepth = options.topFileScanDepth ?? Number(process.env.DISKMIND_TOP_SCAN_DEPTH ?? 4);
   const topFileScanMaxFiles = options.topFileScanMaxFiles ?? Number(process.env.DISKMIND_TOP_SCAN_MAX_FILES ?? 25000);
 
-  const map = await loadMap();
+  const map = await prepareMapForRun(await loadMap());
   const visited = new Set<string>();
 
   const rootCandidates = options.roots && options.roots.length > 0 ? options.roots : getDefaultRoots();
