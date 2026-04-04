@@ -188,7 +188,7 @@ export async function decideNextAction(input: {
     const raw = await chat(prompt, DECISION_SCHEMA);
     console.debug(`[DiskMind LLM] decideNextAction raw response (${raw.length} chars):`, raw.slice(0, 300));
     const parsed = parseJson<AgentDecision>(raw);
-    const parseOk = parsed !== null && ["DELVE", "PLAN", "REPORT"].includes(parsed.action);
+    const parseOk = parsed !== null && isValidDecision(parsed, input.nodes);
     void llmLog({
       call: "decideNextAction",
       provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
@@ -252,6 +252,7 @@ export async function createFinalPlan(input: {
     "Action tags for every finding:",
     "- [PURGE]: safe cache/temp/log cleanup",
     "- [OFFLOAD]: important but cold data on hot/system drive",
+    "- [COMPRESS]: large occasionally-used folder that should be zipped/archived",
     "- [RETAIN]: active data that should stay on current drive",
     "Respond with ONLY a single JSON object. No explanation, no markdown, no extra text.",
     "Use exactly this structure (all fields are required):",
@@ -263,6 +264,7 @@ export async function createFinalPlan(input: {
       offloadChecklist: ["Example: Move C:\\Users\\Name\\Videos\\LargeFile.mp4 (last accessed 2023-08-01) to external drive"],
       semanticActions: [
         "[OFFLOAD] C:\\Users\\Name\\Documents\\backup (16.3 GB) is on hot system drive and looks archive-like; last accessed 120 days ago, low activity; move to external storage.",
+        "[COMPRESS] C:\\Users\\Name\\Media\\Footage (8.4 GB) has occasional activity; compress older chunks into archives.",
         "[PURGE] C:\\Windows\\Temp (0.5 GB) is transient cache/log data with low retention value; safe to clear with -WhatIf.",
         "[RETAIN] C:\\Users\\Name\\Projects\\active-app (2.1 GB) shows recent access and active edits; keep on SSD."
       ],
@@ -277,7 +279,7 @@ export async function createFinalPlan(input: {
     "- Every checklist item must include one or more concrete file/folder paths from the input.",
     "- Use lastAccessedISO to prioritize stale files for offload (older access date = higher offload priority).",
     "- Do not output placeholders, truncation markers, or incomplete paths.",
-    "- Every semanticActions item must start with [PURGE], [OFFLOAD], or [RETAIN] and include concrete path + reason.",
+    "- Every semanticActions item must start with [PURGE], [OFFLOAD], [COMPRESS], or [RETAIN] and include concrete path + reason.",
     `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
     `Potential savings: ${compactSavings}`,
     `Top files: ${compactTopFiles}`
@@ -533,6 +535,23 @@ function isUsableFinalPlan(plan: FinalPlan | null): boolean {
   );
 }
 
+function isValidDecision(decision: AgentDecision, nodes: DiskNode[]): boolean {
+  if (!["DELVE", "PLAN", "REPORT"].includes(decision.action)) {
+    return false;
+  }
+
+  if (decision.action !== "DELVE") {
+    return true;
+  }
+
+  if (!decision.target || !isLiteralWindowsPath(decision.target)) {
+    return false;
+  }
+
+  const knownDirectories = new Set(nodes.filter((node) => node.isDirectory).map((node) => node.path.toLowerCase()));
+  return knownDirectories.has(decision.target.toLowerCase());
+}
+
 function passesSemanticPlanValidation(
   plan: FinalPlan,
   input: { potentialSavings: PotentialSaving[]; topFiles: DiskNode[]; scannedPaths: string[] }
@@ -565,7 +584,7 @@ function passesSemanticPlanValidation(
     return false;
   }
 
-  const validTags = ["[PURGE]", "[OFFLOAD]", "[RETAIN]"];
+  const validTags = ["[PURGE]", "[OFFLOAD]", "[COMPRESS]", "[RETAIN]"];
   if (!plan.semanticActions.every((item) => validTags.some((tag) => item.startsWith(tag)))) {
     return false;
   }
@@ -612,7 +631,13 @@ function sanitizeChecklist(items: string[]): string[] {
 
 function sanitizeSemanticActions(items: string[]): string[] {
   return sanitizeChecklist(items)
-    .filter((item) => item.startsWith("[PURGE]") || item.startsWith("[OFFLOAD]") || item.startsWith("[RETAIN]"))
+    .filter(
+      (item) =>
+        item.startsWith("[PURGE]") ||
+        item.startsWith("[OFFLOAD]") ||
+        item.startsWith("[COMPRESS]") ||
+        item.startsWith("[RETAIN]")
+    )
     .slice(0, 30);
 }
 
@@ -660,8 +685,8 @@ function buildDeterministicFallbackPlan(input: {
   return {
     summary:
       `Detected ${zeroRiskCount} low-risk cleanup targets totaling ${zeroRiskTotal.toFixed(3)} GB. ` +
-      `Large non-system files should be reviewed for archive or offload rather than deleted outright. ` +
-      `Start with the generated zero-risk cleanup script, then move stale large files to external storage.` ,
+      `Large non-system files should be reviewed for archive, compression, or offload rather than deleted outright. ` +
+      `Start with the generated zero-risk cleanup script, then offload stale clusters and compress occasional-use folders.`,
     zeroRiskPowershell: buildDeterministicZeroRiskScript(input.potentialSavings),
     mediumRiskChecklist,
     highRiskChecklist,
@@ -701,6 +726,14 @@ function buildSemanticClusterActions(input: {
         `[OFFLOAD] ${cluster.path} (${cluster.sizeGB.toFixed(3)} GB) appears ${clues.offload ? "archive/backup-like" : "inactive"} ` +
           `(last accessed ~${cluster.averageDaysSinceAccess} days ago, ${frequency} activity) on hot system drive ${cluster.drive}; ` +
           `moving to external storage can reclaim about ${percentHot}% of analyzed hot-drive cluster footprint.`
+      );
+      continue;
+    }
+
+    if (frequency === "medium" && cluster.sizeGB >= 5) {
+      actions.push(
+        `[COMPRESS] ${cluster.path} (${cluster.sizeGB.toFixed(3)} GB) has occasional activity ` +
+          `(last accessed ~${cluster.averageDaysSinceAccess} days ago); compress into archives to reduce footprint while keeping local access.`
       );
       continue;
     }
@@ -819,6 +852,10 @@ function daysSince(iso: string | undefined, nowMs: number): number {
 function extractDrive(filePath: string): string {
   const match = filePath.match(/^[A-Za-z]:/);
   return match ? match[0] : "UNKNOWN";
+}
+
+function isLiteralWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:\\/.test(value);
 }
 
 function buildDeterministicZeroRiskScript(potentialSavings: PotentialSaving[]): string {
