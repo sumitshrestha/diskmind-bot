@@ -146,6 +146,7 @@ async function writeReports(
     mediumRiskChecklist: string[];
     highRiskChecklist: string[];
     offloadChecklist: string[];
+    semanticActions: string[];
     disclaimers: string[];
   },
   potentialSavings: PotentialSaving[]
@@ -172,6 +173,9 @@ async function writeReports(
     "",
     "High Risk / User Action Checklist",
     ...finalPlan.highRiskChecklist.map((item) => `- ${item}`),
+    "",
+    "Semantic Cluster Actions",
+    ...finalPlan.semanticActions.map((item) => `- ${item}`),
     "",
     "Offload Candidates (External Storage)",
     ...finalPlan.offloadChecklist.map((item) => `- ${item}`),

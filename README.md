@@ -1,13 +1,13 @@
 # DiskMind Bot
 
-Read-only, AI-assisted disk analysis bot for large file systems using a hierarchical chunking strategy.
+Read-only, AI-assisted storage intelligence bot for large file systems using hierarchical chunking and semantic cluster analysis.
 
 DiskMind is designed to avoid context-window overload by scanning in stages:
 
 1. Root overview (top-level folders/drives)
 2. Guided deep-dive (LLM picks next path)
 3. Global heavy hitters (top large files)
-4. Final cleanup plan generation (script + checklist)
+4. Final cleanup plan generation (script + semantic actions)
 
 ## Features
 
@@ -15,6 +15,10 @@ DiskMind is designed to avoid context-window overload by scanning in stages:
 - Agentic loop (`DELVE`, `PLAN`, `REPORT`) driven by LLM output
 - Read-only scanner (no automatic deletion)
 - Global `PotentialSavings` and top-files memory across iterations
+- Semantic cluster actions with explicit tags: `[PURGE]`, `[OFFLOAD]`, `[RETAIN]`
+- Drive-tier aware recommendations (hot system drive vs colder storage)
+- Metadata-driven prioritization using `lastAccessedISO` and semantic path clues (`backup`, `archive`, `_v1`, etc.)
+- Deterministic fallback plan when LLM output is generic or unsafe
 - Report generation to `.txt` and `.ps1` artifacts
 - Supports `ollama` (default) or `openai`
 
@@ -106,6 +110,7 @@ Expected console output includes:
 - Path to map database JSON
 - Path to generated cleanup report
 - Path to generated PowerShell script
+- Total elapsed runtime
 
 ## How It Works
 
@@ -117,12 +122,17 @@ Expected console output includes:
    - LLM returns action JSON: `DELVE`, `PLAN`, or `REPORT`.
 3. **Heavy Hitters Chunk**
    - Maintains global top large files list (`topFiles`).
+   - Captures `lastModifiedISO` and `lastAccessedISO` for prioritization.
 4. **Final Plan**
    - Sends `potentialSavings` + `topFiles` + scanned paths to LLM.
+   - Uses semantic validation to reject low-quality/generic plans.
+   - Falls back to deterministic recommendations if LLM output is weak.
    - Produces:
      - Zero-risk PowerShell script
      - Medium-risk checklist
      - High-risk checklist
+     - Offload checklist (external/NAS/cloud candidates)
+     - Semantic Cluster Actions (`[PURGE]`, `[OFFLOAD]`, `[RETAIN]`)
      - Disclaimers
 
 ## Output Artifacts
@@ -132,6 +142,7 @@ Generated at runtime:
 - `data/diskmind-map.json`
 - `reports/cleanup-plan-<timestamp>.txt`
 - `reports/zero-risk-cleanup-<timestamp>.ps1`
+- `logs/llm-calls-<timestamp>.log` (one file per run)
 
 ## Safety Model
 
@@ -141,6 +152,7 @@ DiskMind is intentionally read-only by design.
 - No delete operations are executed by the app.
 - Cleanup script is generated as a file for manual review and manual execution.
 - Script output includes `-WhatIf` guidance.
+- Plans without safe/usable semantics are replaced by deterministic fallback output.
 
 ## Knowledge Base
 
@@ -170,6 +182,11 @@ Reduce scan scope and compute intensity:
 - Set specific `DISKMIND_ROOTS`
 - Lower `DISKMIND_TOP_SCAN_DEPTH`
 - Lower `DISKMIND_TOP_SCAN_MAX_FILES`
+
+### LLM output is generic or not actionable
+
+- DiskMind now applies semantic validation and may replace weak model output with deterministic recommendations.
+- Check `logs/llm-calls-<timestamp>.log` for raw model responses and validation behavior.
 
 ## Roadmap Ideas
 

@@ -38,13 +38,22 @@ const DECISION_SCHEMA = {
 
 const FINAL_PLAN_SCHEMA = {
   type: "object",
-  required: ["summary", "zeroRiskPowershell", "mediumRiskChecklist", "highRiskChecklist", "offloadChecklist", "disclaimers"],
+  required: [
+    "summary",
+    "zeroRiskPowershell",
+    "mediumRiskChecklist",
+    "highRiskChecklist",
+    "offloadChecklist",
+    "semanticActions",
+    "disclaimers"
+  ],
   properties: {
     summary: { type: "string" },
     zeroRiskPowershell: { type: "string" },
     mediumRiskChecklist: { type: "array", items: { type: "string" } },
     highRiskChecklist: { type: "array", items: { type: "string" } },
     offloadChecklist: { type: "array", items: { type: "string" } },
+    semanticActions: { type: "array", items: { type: "string" } },
     disclaimers: { type: "array", items: { type: "string" } }
   },
   additionalProperties: false
@@ -92,6 +101,7 @@ export interface FinalPlan {
   mediumRiskChecklist: string[];
   highRiskChecklist: string[];
   offloadChecklist: string[];
+  semanticActions: string[];
   disclaimers: string[];
 }
 
@@ -231,13 +241,18 @@ export async function createFinalPlan(input: {
   const compactSavings = summarizeSavings(input.potentialSavings, budget.planSavingsLimit);
   const compactTopFiles = summarizeNodes(input.topFiles, budget.planTopFilesLimit);
   const prompt = [
-    "You are DiskMind's cleanup strategist.",
+    "You are the Storage Intelligence Agent for DiskMind.",
     "Analyze the potential savings and classify each item by risk and retention value.",
+    "Operate on semantic clusters (folder-level aggregates), not only individual files.",
     "Risk buckets:",
     "- Zero Risk: Caches, Temp files, Prefetch, logs safe to clear automatically",
     "- Medium Risk: old apps, duplicate AI models, stale SDK caches",
     "- High Risk/User Action: personal media, project folders, unknown binaries",
     "- Offload Candidates: large low-access files better moved to external storage, NAS, or cloud",
+    "Action tags for every finding:",
+    "- [PURGE]: safe cache/temp/log cleanup",
+    "- [OFFLOAD]: important but cold data on hot/system drive",
+    "- [RETAIN]: active data that should stay on current drive",
     "Respond with ONLY a single JSON object. No explanation, no markdown, no extra text.",
     "Use exactly this structure (all fields are required):",
     JSON.stringify({
@@ -246,6 +261,11 @@ export async function createFinalPlan(input: {
       mediumRiskChecklist: ["Example: Review large unused app at C:\\SomePath and list top files"],
       highRiskChecklist: ["Example: Inspect personal folder at C:\\Users\\Name before deleting anything"],
       offloadChecklist: ["Example: Move C:\\Users\\Name\\Videos\\LargeFile.mp4 (last accessed 2023-08-01) to external drive"],
+      semanticActions: [
+        "[OFFLOAD] C:\\Users\\Name\\Documents\\backup (16.3 GB) is on hot system drive and looks archive-like; last accessed 120 days ago, low activity; move to external storage.",
+        "[PURGE] C:\\Windows\\Temp (0.5 GB) is transient cache/log data with low retention value; safe to clear with -WhatIf.",
+        "[RETAIN] C:\\Users\\Name\\Projects\\active-app (2.1 GB) shows recent access and active edits; keep on SSD."
+      ],
       disclaimers: ["Always review the script before running it."]
     }),
     "Rules for zeroRiskPowershell:",
@@ -257,6 +277,7 @@ export async function createFinalPlan(input: {
     "- Every checklist item must include one or more concrete file/folder paths from the input.",
     "- Use lastAccessedISO to prioritize stale files for offload (older access date = higher offload priority).",
     "- Do not output placeholders, truncation markers, or incomplete paths.",
+    "- Every semanticActions item must start with [PURGE], [OFFLOAD], or [RETAIN] and include concrete path + reason.",
     `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
     `Potential savings: ${compactSavings}`,
     `Top files: ${compactTopFiles}`
@@ -280,12 +301,14 @@ export async function createFinalPlan(input: {
       const mediumRiskChecklist = sanitizeChecklist(parsed.mediumRiskChecklist);
       const highRiskChecklist = sanitizeChecklist(parsed.highRiskChecklist);
       const offloadChecklist = sanitizeChecklist(parsed.offloadChecklist);
+      const semanticActions = sanitizeSemanticActions(parsed.semanticActions);
       const candidatePlan: FinalPlan = {
         summary: parsed.summary ?? "No summary produced.",
         zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
         mediumRiskChecklist,
         highRiskChecklist,
         offloadChecklist,
+        semanticActions,
         disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
       };
 
@@ -505,6 +528,7 @@ function isUsableFinalPlan(plan: FinalPlan | null): boolean {
     Array.isArray(plan.mediumRiskChecklist) &&
     Array.isArray(plan.highRiskChecklist) &&
     Array.isArray(plan.offloadChecklist) &&
+    Array.isArray(plan.semanticActions) &&
     Array.isArray(plan.disclaimers)
   );
 }
@@ -534,6 +558,19 @@ function passesSemanticPlanValidation(
   }
 
   if (!containsConcretePath(plan.offloadChecklist, topFilePaths)) {
+    return false;
+  }
+
+  if (plan.semanticActions.length < 3) {
+    return false;
+  }
+
+  const validTags = ["[PURGE]", "[OFFLOAD]", "[RETAIN]"];
+  if (!plan.semanticActions.every((item) => validTags.some((tag) => item.startsWith(tag)))) {
+    return false;
+  }
+
+  if (!containsConcretePath(plan.semanticActions, topFilePaths) && !containsPotentialPath(plan.semanticActions, input.potentialSavings)) {
     return false;
   }
 
@@ -573,6 +610,12 @@ function sanitizeChecklist(items: string[]): string[] {
   return output.slice(0, 20);
 }
 
+function sanitizeSemanticActions(items: string[]): string[] {
+  return sanitizeChecklist(items)
+    .filter((item) => item.startsWith("[PURGE]") || item.startsWith("[OFFLOAD]") || item.startsWith("[RETAIN]"))
+    .slice(0, 30);
+}
+
 function buildFallbackOffloadChecklist(topFiles: DiskNode[]): string[] {
   return topFiles
     .filter((file) => !file.isDirectory)
@@ -586,6 +629,11 @@ function buildFallbackOffloadChecklist(topFiles: DiskNode[]): string[] {
 function containsConcretePath(items: string[], knownPaths: string[]): boolean {
   const lowerKnown = knownPaths.map((path) => path.toLowerCase());
   return items.some((item) => lowerKnown.some((path) => item.toLowerCase().includes(path.toLowerCase())));
+}
+
+function containsPotentialPath(items: string[], potentialSavings: PotentialSaving[]): boolean {
+  const paths = potentialSavings.map((item) => item.path.toLowerCase());
+  return items.some((item) => paths.some((path) => item.toLowerCase().includes(path)));
 }
 
 function buildDeterministicFallbackPlan(input: {
@@ -607,6 +655,8 @@ function buildDeterministicFallbackPlan(input: {
     .slice(0, 6)
     .map((file) => `Verify ownership and importance of ${file.path} (${file.sizeGB.toFixed(3)} GB) before any destructive action.`);
 
+  const semanticActions = buildSemanticClusterActions(input);
+
   return {
     summary:
       `Detected ${zeroRiskCount} low-risk cleanup targets totaling ${zeroRiskTotal.toFixed(3)} GB. ` +
@@ -619,8 +669,156 @@ function buildDeterministicFallbackPlan(input: {
       const access = file.lastAccessedISO ?? "unknown";
       return `Move ${file.path} (${file.sizeGB.toFixed(3)} GB, last accessed ${access}) to external storage if no longer needed locally.`;
     }),
+    semanticActions,
     disclaimers: ["Review all recommendations manually before running scripts or moving files."]
   };
+}
+
+function buildSemanticClusterActions(input: {
+  potentialSavings: PotentialSaving[];
+  topFiles: DiskNode[];
+  scannedPaths: string[];
+}): string[] {
+  const systemDrive = (process.env.SystemDrive ?? "C:").replace(/\\$/, "").toUpperCase();
+  const clusters = aggregateSemanticClusters(input.topFiles);
+  const actions: string[] = [];
+
+  for (const cluster of clusters.slice(0, 12)) {
+    const hotDrive = cluster.drive.toUpperCase() === systemDrive;
+    const clues = semanticClues(cluster.path);
+    const frequency = frequencyFromDays(cluster.averageDaysSinceAccess);
+    const percentHot = hotDrive && cluster.totalHotGb > 0 ? ((cluster.sizeGB / cluster.totalHotGb) * 100).toFixed(1) : "0.0";
+
+    if (clues.purge) {
+      actions.push(
+        `[PURGE] ${cluster.path} (${cluster.sizeGB.toFixed(3)} GB) matches cache/temp/log semantics and ${frequency} activity; clear with -WhatIf to reclaim space safely.`
+      );
+      continue;
+    }
+
+    if (hotDrive && (frequency === "low" || clues.offload)) {
+      actions.push(
+        `[OFFLOAD] ${cluster.path} (${cluster.sizeGB.toFixed(3)} GB) appears ${clues.offload ? "archive/backup-like" : "inactive"} ` +
+          `(last accessed ~${cluster.averageDaysSinceAccess} days ago, ${frequency} activity) on hot system drive ${cluster.drive}; ` +
+          `moving to external storage can reclaim about ${percentHot}% of analyzed hot-drive cluster footprint.`
+      );
+      continue;
+    }
+
+    actions.push(
+      `[RETAIN] ${cluster.path} (${cluster.sizeGB.toFixed(3)} GB) shows ${frequency} activity ` +
+        `(last accessed ~${cluster.averageDaysSinceAccess} days ago); keep on current ${hotDrive ? "hot" : "cold"} drive for performance.`
+    );
+  }
+
+  if (actions.length === 0) {
+    actions.push("[RETAIN] No strong semantic clusters identified from sampled top files; keep current placement and continue monitoring.");
+  }
+
+  return actions.slice(0, 20);
+}
+
+interface SemanticCluster {
+  path: string;
+  drive: string;
+  sizeGB: number;
+  averageDaysSinceAccess: number;
+  totalHotGb: number;
+}
+
+function aggregateSemanticClusters(topFiles: DiskNode[]): SemanticCluster[] {
+  const now = Date.now();
+  const grouped = new Map<string, { sizeGB: number; days: number[]; drive: string }>();
+
+  for (const file of topFiles) {
+    if (file.isDirectory) {
+      continue;
+    }
+
+    const root = semanticClusterRoot(file.path);
+    const drive = extractDrive(file.path);
+    const days = daysSince(file.lastAccessedISO, now);
+    const existing = grouped.get(root);
+
+    if (existing) {
+      existing.sizeGB += file.sizeGB;
+      existing.days.push(days);
+    } else {
+      grouped.set(root, { sizeGB: file.sizeGB, days: [days], drive });
+    }
+  }
+
+  const systemDrive = (process.env.SystemDrive ?? "C:").replace(/\\$/, "").toUpperCase();
+  const totalHotGb = Array.from(grouped.values())
+    .filter((item) => item.drive.toUpperCase() === systemDrive)
+    .reduce((sum, item) => sum + item.sizeGB, 0);
+
+  return Array.from(grouped.entries())
+    .map(([clusterPath, value]) => ({
+      path: clusterPath,
+      drive: value.drive,
+      sizeGB: value.sizeGB,
+      averageDaysSinceAccess: Math.round(value.days.reduce((sum, d) => sum + d, 0) / Math.max(1, value.days.length)),
+      totalHotGb
+    }))
+    .sort((a, b) => b.sizeGB - a.sizeGB);
+}
+
+function semanticClusterRoot(filePath: string): string {
+  const parts = filePath.split("\\").filter(Boolean);
+  if (parts.length <= 2) {
+    return parts.join("\\");
+  }
+
+  if (parts[1]?.toLowerCase() === "users" && parts.length >= 5) {
+    if (["documents", "desktop"].includes(parts[3]?.toLowerCase()) && parts[4]) {
+      return `${parts[0]}\\${parts[1]}\\${parts[2]}\\${parts[3]}\\${parts[4]}`;
+    }
+
+    return `${parts[0]}\\${parts[1]}\\${parts[2]}\\${parts[3]}`;
+  }
+
+  if (["windows", "program files", "program files (x86)", "programdata"].includes(parts[1]?.toLowerCase())) {
+    return parts.length >= 3 ? `${parts[0]}\\${parts[1]}\\${parts[2]}` : `${parts[0]}\\${parts[1]}`;
+  }
+
+  return `${parts[0]}\\${parts[1]}\\${parts[2]}`;
+}
+
+function semanticClues(clusterPath: string): { purge: boolean; offload: boolean } {
+  const lower = clusterPath.toLowerCase();
+  return {
+    purge: /(\\temp\\|\\cache\\|\\logs?\\|\$recycle\.bin|installer\\msi.*\.tmp|windows\\temp)/.test(lower),
+    offload: /(backup|archive|_v\d+|old|exports?|media|videos?|downloads?)/.test(lower)
+  };
+}
+
+function frequencyFromDays(days: number): "high" | "medium" | "low" {
+  if (days <= 7) {
+    return "high";
+  }
+  if (days <= 45) {
+    return "medium";
+  }
+  return "low";
+}
+
+function daysSince(iso: string | undefined, nowMs: number): number {
+  if (!iso) {
+    return 365;
+  }
+
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) {
+    return 365;
+  }
+
+  return Math.max(0, Math.round((nowMs - ts) / (1000 * 60 * 60 * 24)));
+}
+
+function extractDrive(filePath: string): string {
+  const match = filePath.match(/^[A-Za-z]:/);
+  return match ? match[0] : "UNKNOWN";
 }
 
 function buildDeterministicZeroRiskScript(potentialSavings: PotentialSaving[]): string {
