@@ -23,6 +23,7 @@ async function main(): Promise<void> {
 
     console.log("DiskMind completed analysis.");
     console.log(`Map database: ${getDatabasePath()}`);
+    console.log(`Runtime log: ${result.logPath}`);
     console.log(`Cleanup report: ${result.reportPath}`);
     console.log(`PowerShell script (manual execution only): ${result.scriptPath}`);
     console.log(`Total time: ${formatDuration(Date.now() - startedAt)}`);

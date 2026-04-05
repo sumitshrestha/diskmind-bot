@@ -6,6 +6,7 @@ import {
   getDirectorySummary,
   getDefaultRoots,
   getExistingRoots,
+  shouldExcludeDirectory,
   DiskNode
 } from "./scanner";
 import {
@@ -28,86 +29,339 @@ export interface AgentOptions {
   roots?: string[];
 }
 
-export async function startAnalysis(options: AgentOptions = {}): Promise<{ reportPath: string; scriptPath: string }> {
+interface ScanCoverage {
+  roots: string[];
+  maxIterations: number;
+  processedDirectories: number;
+  discoveredDirectories: number;
+  scannedPathCount: number;
+  remainingQueue: number;
+  reachedIterationCap: boolean;
+  maxItemsPerDirectory: number;
+  diveSummaryDepth: number;
+  folderSizeDepth: number;
+}
+
+export async function startAnalysis(options: AgentOptions = {}): Promise<{ reportPath: string; scriptPath: string; logPath: string }> {
+  const runId = new Date().toISOString().replace(/[.:]/g, "-");
+  const logDir = path.join(process.cwd(), "logs");
+  const runtimeLogPath = path.join(logDir, `scan-progress-${runId}.log`);
+
+  await fs.ensureDir(logDir);
+  await archiveTopLevelFilesToPrev(logDir);
+  await fs.writeFile(runtimeLogPath, `# DiskMind scan log\n# runId=${runId}\n`, "utf8");
+
+  const maxIterations = options.maxIterations ?? Number(process.env.DISKMIND_MAX_ITERATIONS ?? 10);
+  const targetCoverage = Math.min(100, Math.max(1, Number(process.env.DISKMIND_TARGET_COVERAGE ?? 75)));
   const rootSummaryDepth = options.rootSummaryDepth ?? 1;
   const diveSummaryDepth = options.diveSummaryDepth ?? 1;
+  const folderSizeDepth = Number(process.env.DISKMIND_FOLDER_SIZE_DEPTH ?? 1);
+  const folderSizeMaxEntries = Number(process.env.DISKMIND_FOLDER_SIZE_MAX_ENTRIES ?? 2000);
   const topFilesLimit = options.topFilesLimit ?? Number(process.env.DISKMIND_TOP_FILES_LIMIT ?? 500);
   const maxItemsPerDirectory =
-    options.maxItemsPerDirectory ?? Number(process.env.DISKMIND_MAX_ITEMS_PER_DIR ?? 200000);
+    options.maxItemsPerDirectory ?? Number(process.env.DISKMIND_MAX_ITEMS_PER_DIR ?? 5000);
+  const maxDirsToQueuePerScan = Number(process.env.DISKMIND_MAX_DIRS_ENQUEUE_PER_SCAN ?? 64);
+  const minDirsToQueuePerScan = Number(process.env.DISKMIND_MIN_DIRS_ENQUEUE_PER_SCAN ?? 8);
+  const adaptiveQueueEnabled = (process.env.DISKMIND_ADAPTIVE_QUEUE ?? "true").toLowerCase() !== "false";
+  const queuePressureMultiplier = Number(process.env.DISKMIND_QUEUE_PRESSURE_MULTIPLIER ?? 2);
+  const queueRelaxMultiplier = Number(process.env.DISKMIND_QUEUE_RELAX_MULTIPLIER ?? 0.75);
+  const adaptiveRebalanceEvery = Number(process.env.DISKMIND_ADAPTIVE_REBALANCE_EVERY ?? 20);
+  const saveEveryDirectories = Number(process.env.DISKMIND_SAVE_EVERY_DIRS ?? 25);
+  const progressLogEveryDirectories = Number(process.env.DISKMIND_PROGRESS_EVERY_DIRS ?? 10);
+  const progressLogIntervalMs = Number(process.env.DISKMIND_PROGRESS_INTERVAL_MS ?? 5000);
+  const heartbeatIntervalMs = Number(process.env.DISKMIND_HEARTBEAT_INTERVAL_MS ?? 15000);
 
   const map = await prepareMapForRun(await loadMap());
   const visited = new Set<string>();
   const queued = new Set<string>();
-
-  const rootCandidates = options.roots && options.roots.length > 0 ? options.roots : getDefaultRoots();
-  const roots = await getExistingRoots(rootCandidates);
-  if (roots.length === 0) {
-    throw new Error("No readable roots found. Set DISKMIND_ROOTS to one or more accessible paths.");
-  }
-
-  console.log("DiskMind Bot: analyzing root overview...");
-
+  const runStartedAt = Date.now();
+  let processedDirectories = 0;
+  let discoveredDirectories = 0;
+  let pendingSaveCount = 0;
+  let lastProgressLogAt = 0;
+  let lastSaveAt = Date.now();
+  let currentQueueFanout = Math.max(1, maxDirsToQueuePerScan);
+  let effectiveMaxIterations = maxIterations;
   const queue: string[] = [];
-  for (const root of roots) {
-    const snapshot = await getDirectorySummary(root, {
-      depth: rootSummaryDepth,
-      folderSizeDepth: rootSummaryDepth,
-      maxItems: maxItemsPerDirectory
-    });
+  const heartbeatTimer = setInterval(() => {
+    emit(makeProgressLine("heartbeat"));
+  }, heartbeatIntervalMs);
+  heartbeatTimer.unref();
 
-    updateSnapshot(map, snapshot);
-    mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
-    mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
-
-    queue.push(root);
-    queued.add(root);
-    await saveMap(map);
-  }
-
-  while (queue.length > 0) {
-    const currentPath = queue.shift();
-    if (!currentPath) {
-      continue;
-    }
-    queued.delete(currentPath);
-
-    if (visited.has(currentPath)) {
-      continue;
+  try {
+    const rootCandidates = options.roots && options.roots.length > 0 ? options.roots : getDefaultRoots();
+    const roots = await getExistingRoots(rootCandidates);
+    if (roots.length === 0) {
+      throw new Error("No readable roots found. Set DISKMIND_ROOTS to one or more accessible paths.");
     }
 
-    visited.add(currentPath);
+    emit("DiskMind Bot: analyzing root overview...");
+    emit(
+      `Scan settings: maxIterations=${maxIterations}, maxItemsPerDirectory=${maxItemsPerDirectory}, ` +
+        `folderSizeDepth=${folderSizeDepth}, queueFanout=${maxDirsToQueuePerScan}, adaptiveQueue=${adaptiveQueueEnabled}`
+    );
+    emit(`Runtime scan log: ${runtimeLogPath}`);
 
-    const snapshot = await getDirectorySummary(currentPath, {
-      depth: diveSummaryDepth,
-      folderSizeDepth: diveSummaryDepth,
-      maxItems: maxItemsPerDirectory
-    });
+    for (const root of roots) {
+      emit(`Root scan start: ${root}`);
+      const snapshot = await getDirectorySummary(root, {
+        depth: rootSummaryDepth,
+        folderSizeDepth,
+        folderSizeMaxEntries,
+        maxItems: maxItemsPerDirectory
+      });
 
-    updateSnapshot(map, snapshot);
-    mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
-    mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
+      updateSnapshot(map, snapshot);
+      mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
+      mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
 
-    const nextDirs = snapshot.nodes
-      .filter((node) => node.isDirectory && isLiteralWindowsPath(node.path))
-      .sort((a, b) => b.sizeGB - a.sizeGB);
+      queue.push(root);
+      queued.add(root);
+      discoveredDirectories += 1;
+      pendingSaveCount += 1;
+      await maybeCheckpoint(true);
+      logProgress(`root complete ${root}`, true);
+    }
 
-    for (const node of nextDirs) {
-      if (!visited.has(node.path) && !queued.has(node.path)) {
-        queue.push(node.path);
-        queued.add(node.path);
+    while (queue.length > 0 && processedDirectories < effectiveMaxIterations) {
+      const currentPath = queue.shift();
+      if (!currentPath) {
+        continue;
+      }
+      queued.delete(currentPath);
+
+      if (visited.has(currentPath)) {
+        continue;
+      }
+
+      visited.add(currentPath);
+
+      const snapshot = await getDirectorySummary(currentPath, {
+        depth: diveSummaryDepth,
+        folderSizeDepth,
+        folderSizeMaxEntries,
+        maxItems: maxItemsPerDirectory
+      });
+
+      updateSnapshot(map, snapshot);
+      mergePotentialSavings(map, detectPotentialSavings(snapshot.nodes));
+      mergeTopFiles(map, pickTopFilesFromNodes(snapshot.nodes, topFilesLimit), topFilesLimit);
+      processedDirectories += 1;
+      pendingSaveCount += 1;
+
+      const nextDirs = snapshot.nodes
+        .filter((node) => {
+          if (!node.isDirectory || !isLiteralWindowsPath(node.path)) return false;
+          return !shouldExcludeDirectory(node.path);
+        })
+        .sort((a, b) => b.sizeGB - a.sizeGB)
+        .slice(0, currentQueueFanout);
+
+      for (const node of nextDirs) {
+        if (!visited.has(node.path) && !queued.has(node.path)) {
+          queue.push(node.path);
+          queued.add(node.path);
+          discoveredDirectories += 1;
+        }
+      }
+
+      await maybeCheckpoint(false);
+      logProgress(`scanned ${currentPath}`, false);
+
+      if (adaptiveQueueEnabled && processedDirectories % Math.max(1, adaptiveRebalanceEvery) === 0) {
+        rebalanceQueuePressure();
+      }
+
+      if (queue.length > 0 && processedDirectories >= effectiveMaxIterations) {
+        if (shouldExtendIterationBudgetForCoverage()) {
+          const extension = 100;
+          effectiveMaxIterations += extension;
+          const currentCoverage = discoveredDirectories > 0 
+            ? Math.round((processedDirectories / discoveredDirectories) * 100) 
+            : 0;
+          emit(
+            `[Coverage] Extended iterations by ${extension}; new cap=${effectiveMaxIterations}, ` +
+              `current coverage=${currentCoverage}%, target=${targetCoverage}%, queue=${queue.length}`
+          );
+        }
       }
     }
 
+    if (queue.length > 0 && processedDirectories >= effectiveMaxIterations) {
+      emit(
+        `Reached iteration cap (${effectiveMaxIterations}). ` +
+          `Generating report from current dataset with ${Object.keys(map.scannedPaths).length} scanned paths.`
+      );
+    }
+
     await saveMap(map);
+    logProgress("final checkpoint saved", true);
+
+    const finalPlan = await createFinalPlan({
+      potentialSavings: map.potentialSavings,
+      topFiles: map.topFiles,
+      scannedPaths: Object.keys(map.scannedPaths)
+    });
+
+    const scannedPathKeys = Object.keys(map.scannedPaths);
+    const coverage: ScanCoverage = {
+      roots,
+      maxIterations: effectiveMaxIterations,
+      processedDirectories,
+      discoveredDirectories,
+      scannedPathCount: scannedPathKeys.length,
+      remainingQueue: queue.length,
+      reachedIterationCap: queue.length > 0 && processedDirectories >= effectiveMaxIterations,
+      maxItemsPerDirectory,
+      diveSummaryDepth,
+      folderSizeDepth
+    };
+
+    const reports = await writeReports(finalPlan, map.potentialSavings, map.topFiles, scannedPathKeys, coverage);
+    emit(`Analysis complete. Report: ${reports.reportPath}`);
+    emit(`Analysis complete. Script: ${reports.scriptPath}`);
+
+    return {
+      ...reports,
+      logPath: runtimeLogPath
+    };
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 
-  const finalPlan = await createFinalPlan({
-    potentialSavings: map.potentialSavings,
-    topFiles: map.topFiles,
-    scannedPaths: Object.keys(map.scannedPaths)
-  });
+  async function maybeCheckpoint(force: boolean): Promise<void> {
+    const now = Date.now();
+    const dueByCount = pendingSaveCount >= saveEveryDirectories;
+    const dueByTime = now - lastSaveAt >= 15000;
 
-  return writeReports(finalPlan, map.potentialSavings, map.topFiles, Object.keys(map.scannedPaths));
+    if (!force && !dueByCount && !dueByTime) {
+      return;
+    }
+
+    await saveMap(map);
+    pendingSaveCount = 0;
+    lastSaveAt = Date.now();
+  }
+
+  function logProgress(event: string, force: boolean): void {
+    const now = Date.now();
+    const dueByCount = processedDirectories > 0 && processedDirectories % progressLogEveryDirectories === 0;
+    const dueByTime = now - lastProgressLogAt >= progressLogIntervalMs;
+    if (!force && !dueByCount && !dueByTime) {
+      return;
+    }
+
+    emit(makeProgressLine(event));
+
+    lastProgressLogAt = now;
+  }
+
+  function makeProgressLine(event: string): string {
+    const now = Date.now();
+
+    const elapsedMs = now - runStartedAt;
+    const avgMsPerDir = processedDirectories > 0 ? elapsedMs / processedDirectories : 0;
+    const etaSeconds = avgMsPerDir > 0 ? Math.round((queue.length * avgMsPerDir) / 1000) : 0;
+    const etaText = queue.length > 0 ? `${etaSeconds}s` : "0s";
+
+    return (
+      `[Progress] ${event} | processed=${processedDirectories}/${effectiveMaxIterations} ` +
+      `queue=${queue.length} discovered=${discoveredDirectories} scannedPaths=${Object.keys(map.scannedPaths).length} ` +
+      `savings=${map.potentialSavings.length} topFiles=${map.topFiles.length} elapsed=${formatElapsed(elapsedMs)} eta=${etaText}`
+    );
+  }
+
+  function rebalanceQueuePressure(): void {
+    const remainingBudget = Math.max(1, effectiveMaxIterations - processedDirectories);
+    const pressureThreshold = Math.ceil(remainingBudget * Math.max(1, queuePressureMultiplier));
+    const relaxThreshold = Math.floor(remainingBudget * Math.max(0.1, queueRelaxMultiplier));
+
+    if (queue.length > pressureThreshold && currentQueueFanout > minDirsToQueuePerScan) {
+      const nextFanout = Math.max(minDirsToQueuePerScan, currentQueueFanout - 4);
+      if (nextFanout !== currentQueueFanout) {
+        currentQueueFanout = nextFanout;
+        emit(
+          `[Adaptive] High queue pressure detected (queue=${queue.length}, budget=${remainingBudget}). ` +
+            `Reducing fanout to ${currentQueueFanout}.`
+        );
+      }
+      return;
+    }
+
+    if (queue.length < relaxThreshold && currentQueueFanout < maxDirsToQueuePerScan) {
+      const nextFanout = Math.min(maxDirsToQueuePerScan, currentQueueFanout + 2);
+      if (nextFanout !== currentQueueFanout) {
+        currentQueueFanout = nextFanout;
+        emit(
+          `[Adaptive] Queue pressure relaxed (queue=${queue.length}, budget=${remainingBudget}). ` +
+            `Increasing fanout to ${currentQueueFanout}.`
+        );
+      }
+    }
+  }
+
+  function shouldExtendIterationBudgetForCoverage(): boolean {
+    // Hard limit: don't go beyond 5x the initial budget
+    const absoluteHardCap = maxIterations * 5;
+    if (effectiveMaxIterations >= absoluteHardCap) {
+      emit(`[Coverage] Reached hard cap (${absoluteHardCap}). No more extensions.`);
+      return false;
+    }
+
+    // If we haven't discovered much yet, extend to gather more data
+    if (discoveredDirectories < 100) {
+      return true;
+    }
+
+    // Calculate current coverage
+    const currentCoverage = (processedDirectories / discoveredDirectories) * 100;
+
+    // Extend if we're below target AND queue has items AND we have found useful data
+    const belowTarget = currentCoverage < targetCoverage;
+    const hasQueue = queue.length > 0;
+    const hasData = map.potentialSavings.length > 5 || map.topFiles.length > 10;
+
+    if (belowTarget && hasQueue && hasData) {
+      console.debug(
+        `[Coverage Check] current=${currentCoverage.toFixed(1)}% target=${targetCoverage}% ` +
+        `processed=${processedDirectories}/${discoveredDirectories} → extending`
+      );
+      return true;
+    }
+
+    if (!belowTarget) {
+      emit(`[Coverage] Target coverage (${targetCoverage}%) reached at ${currentCoverage.toFixed(1)}%. Stopping.`);
+    }
+
+    return false;
+  }
+
+  function emit(message: string): void {
+    console.log(message);
+    void appendRuntimeLog(message).catch(() => undefined);
+  }
+
+  async function appendRuntimeLog(message: string): Promise<void> {
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+    await fs.appendFile(runtimeLogPath, line, "utf8");
+  }
+}
+
+function formatElapsed(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${seconds}s`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+
+  return `${seconds}s`;
 }
 
 function pickTopFilesFromNodes(nodes: DiskNode[], limit: number): DiskNode[] {
@@ -149,10 +403,12 @@ async function writeReports(
   },
   potentialSavings: PotentialSaving[],
   topFiles: DiskNode[],
-  scannedPaths: string[]
+  scannedPaths: string[],
+  coverage: ScanCoverage
 ): Promise<{ reportPath: string; scriptPath: string }> {
   const reportsDir = path.join(process.cwd(), "reports");
   await fs.ensureDir(reportsDir);
+  await archiveTopLevelFilesToPrev(reportsDir);
 
   const stamp = new Date().toISOString().replace(/[.:]/g, "-");
   const reportPath = path.join(reportsDir, `cleanup-plan-${stamp}.html`);
@@ -166,6 +422,12 @@ async function writeReports(
     .reduce((sum, row) => sum + row.sizeGB, 0);
   const freeSpaceInfo = await getDriveSpaceInfo(targetDrive);
   const projectedFreeGb = freeSpaceInfo.freeGb !== null ? freeSpaceInfo.freeGb + potentialRecoveryGb : null;
+  const coverageClass = coverage.reachedIterationCap ? "#fff3cd" : "#d4edda";
+  const coverageBorder = coverage.reachedIterationCap ? "#ffeeba" : "#c3e6cb";
+  const coverageStatus = coverage.reachedIterationCap
+    ? "Partial scan: iteration cap reached before queue exhaustion."
+    : "Complete queue scan within configured bounds.";
+  const rootsLabel = coverage.roots.join(", ");
 
   const tableRows = rows.length
     ? rows
@@ -174,7 +436,7 @@ async function writeReports(
           return [
             `<tr style="background-color: ${style.background}; border-bottom: 1px solid ${style.border};">`,
             `  <td style="padding: 10px;">${escapeHtml(row.path)}</td>`,
-            `  <td style="padding: 10px;">${row.sizeGB.toFixed(3)} GB</td>`,
+            `  <td style="padding: 10px;">${formatSizeFromGb(row.sizeGB)}</td>`,
             `  <td style="padding: 10px;">${escapeHtml(row.category)}</td>`,
             `  <td style="padding: 10px;"><strong>[${row.action}]</strong></td>`,
             `  <td style="padding: 10px;">${escapeHtml(row.justification)}</td>`,
@@ -195,13 +457,22 @@ async function writeReports(
   const reportHtml = [
     `<div style="font-family: Segoe UI, Tahoma, Arial, sans-serif; padding: 20px; color: #1f2933;">`,
     `  <h2 style="color: #1f2933; margin: 0 0 8px;">Storage Analysis: Drive ${escapeHtml(targetDrive)}</h2>`,
+    `  <div style="background-color: ${coverageClass}; border: 1px solid ${coverageBorder}; padding: 10px; margin: 0 0 14px;">`,
+    `    <p style="margin: 0 0 6px;"><strong>Scan Coverage:</strong> ${escapeHtml(coverageStatus)}</p>`,
+    `    <p style="margin: 0 0 4px;"><strong>Roots:</strong> ${escapeHtml(rootsLabel)}</p>`,
+    `    <p style="margin: 0 0 4px;"><strong>Directories Processed:</strong> ${coverage.processedDirectories} / ${coverage.maxIterations} (iteration cap)</p>`,
+    `    <p style="margin: 0 0 4px;"><strong>Directories Discovered:</strong> ${coverage.discoveredDirectories}</p>`,
+    `    <p style="margin: 0 0 4px;"><strong>Paths Snapshotted:</strong> ${coverage.scannedPathCount}</p>`,
+    `    <p style="margin: 0 0 4px;"><strong>Remaining Queue:</strong> ${coverage.remainingQueue}</p>`,
+    `    <p style="margin: 0;"><strong>Scan Bounds:</strong> maxItemsPerDirectory=${coverage.maxItemsPerDirectory}, diveDepth=${coverage.diveSummaryDepth}, folderSizeDepth=${coverage.folderSizeDepth}</p>`,
+    `  </div>`,
     `  <h3 style="color: #1f2933; margin: 0 0 8px;">Space Recovery Projection</h3>`,
-    `  <p style="margin: 0 0 4px;"><strong>Current Free Space:</strong> ${formatGb(freeSpaceInfo.freeGb)}</p>`,
-    `  <p style="margin: 0 0 4px;"><strong>Projected Free Space (after Purge & Offload):</strong> ${formatGb(projectedFreeGb)}</p>`,
-    `  <p style="margin: 0 0 12px;"><strong>Total Recovery Potential:</strong> ${potentialRecoveryGb.toFixed(3)} GB</p>`,
+    `  <p style="margin: 0 0 4px;"><strong>Current Free Space:</strong> ${formatSizeFromGb(freeSpaceInfo.freeGb)}</p>`,
+    `  <p style="margin: 0 0 4px;"><strong>Projected Free Space (after Purge & Offload):</strong> ${formatSizeFromGb(projectedFreeGb)}</p>`,
+    `  <p style="margin: 0 0 12px;"><strong>Total Recovery Potential:</strong> ${formatSizeFromGb(potentialRecoveryGb)}</p>`,
     `  <p style="margin: 0 0 4px;"><strong>Target Drive:</strong> ${escapeHtml(targetDrive)}</p>`,
-    `  <p style="margin: 0 0 4px;"><strong>Total Size:</strong> ${totalSizeGb.toFixed(3)} GB</p>`,
-    `  <p style="margin: 0 0 16px;"><strong>Potential Space Recovery:</strong> ${potentialRecoveryGb.toFixed(3)} GB</p>`,
+    `  <p style="margin: 0 0 4px;"><strong>Total Size:</strong> ${formatSizeFromGb(totalSizeGb)}</p>`,
+    `  <p style="margin: 0 0 16px;"><strong>Potential Space Recovery:</strong> ${formatSizeFromGb(potentialRecoveryGb)}</p>`,
     `  <table style="width: 100%; border-collapse: collapse;">`,
     `    <tr style="background-color: #f8f9fa; border-bottom: 2px solid #dee2e6;">`,
     `      <th style="padding: 10px; text-align: left;">Path</th>`,
@@ -235,6 +506,22 @@ async function writeReports(
   return { reportPath, scriptPath };
 }
 
+async function archiveTopLevelFilesToPrev(targetDir: string): Promise<void> {
+  const previousDir = path.join(targetDir, "prev");
+  await fs.ensureDir(previousDir);
+
+  const entries = await fs.readdir(targetDir, { withFileTypes: true });
+  const filesToArchive = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name);
+
+  await Promise.all(
+    filesToArchive.map((name) =>
+      fs.move(path.join(targetDir, name), path.join(previousDir, name), { overwrite: true })
+    )
+  );
+}
+
 interface ReportRow {
   path: string;
   sizeGB: number;
@@ -263,7 +550,7 @@ function buildReportRows(semanticActions: string[], potentialSavings: PotentialS
   }
 
   for (const item of potentialSavings) {
-    const pathValue = toPlaceholderPath(item.path);
+    const pathValue = normalizeWindowsPath(item.path);
     const key = `PURGE|${pathValue}`.toLowerCase();
     if (seen.has(key)) {
       continue;
@@ -292,7 +579,7 @@ function parseSemanticAction(item: string): ReportRow | null {
   }
 
   const action = match[1] as "PURGE" | "OFFLOAD" | "COMPRESS" | "RETAIN";
-  const pathValue = toPlaceholderPath(match[2].trim());
+  const pathValue = normalizeWindowsPath(match[2].trim());
   const sizeGB = Number(match[3]);
   const reasoning = ensureSentence(match[4].trim());
 
@@ -343,10 +630,8 @@ function resolveTargetDrive(scannedPaths: string[]): string {
   return envDrive || "${DRIVE_LETTER}";
 }
 
-function toPlaceholderPath(rawPath: string): string {
-  const normalized = rawPath.replace(/\//g, "\\");
-  const withUser = normalized.replace(/^([A-Za-z]:\\Users\\)[^\\]+/i, "$1${USER_NAME}");
-  return withUser.replace(/^([A-Za-z]:\\)MyDocuments\\/i, "$1Users\\${USER_NAME}\\Documents\\");
+function normalizeWindowsPath(rawPath: string): string {
+  return rawPath.replace(/\//g, "\\");
 }
 
 function ensureSentence(text: string): string {
@@ -401,15 +686,15 @@ function buildCompressionRows(topFiles: DiskNode[], seen: Set<string>): ReportRo
 
   const rows: ReportRow[] = [];
   for (const candidate of candidates) {
-    const placeholder = toPlaceholderPath(candidate.cluster);
-    const key = `COMPRESS|${placeholder}`.toLowerCase();
+    const clusterPath = normalizeWindowsPath(candidate.cluster);
+    const key = `COMPRESS|${clusterPath}`.toLowerCase();
     if (seen.has(key)) {
       continue;
     }
 
     seen.add(key);
     rows.push({
-      path: placeholder,
+      path: clusterPath,
       sizeGB: Number(candidate.sizeGB.toFixed(3)),
       category: "Occasional-Use Cluster",
       action: "COMPRESS",
@@ -473,4 +758,29 @@ function formatGb(value: number | null): string {
   }
 
   return `${value.toFixed(3)} GB`;
+}
+
+function formatSizeFromGb(valueGb: number | null): string {
+  if (valueGb === null || !Number.isFinite(valueGb)) {
+    return "Unknown";
+  }
+
+  const bytes = Math.max(0, valueGb * 1024 ** 3);
+  if (bytes >= 1024 ** 4) {
+    return `${(bytes / 1024 ** 4).toFixed(3)} TB`;
+  }
+
+  if (bytes >= 1024 ** 3) {
+    return `${(bytes / 1024 ** 3).toFixed(3)} GB`;
+  }
+
+  if (bytes >= 1024 ** 2) {
+    return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+  }
+
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(2)} KB`;
+  }
+
+  return `${Math.round(bytes)} B`;
 }

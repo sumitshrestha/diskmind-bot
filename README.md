@@ -78,6 +78,14 @@ DISKMIND_MAX_ITERATIONS=10
 DISKMIND_ROOT_DEPTH=1
 DISKMIND_DIVE_DEPTH=2
 DISKMIND_TOP_FILES_LIMIT=50
+DISKMIND_MAX_ITEMS_PER_DIR=5000
+DISKMIND_MAX_DIRS_ENQUEUE_PER_SCAN=64
+DISKMIND_FOLDER_SIZE_DEPTH=1
+DISKMIND_FOLDER_SIZE_MAX_ENTRIES=2000
+DISKMIND_SAVE_EVERY_DIRS=25
+DISKMIND_PROGRESS_EVERY_DIRS=10
+DISKMIND_PROGRESS_INTERVAL_MS=5000
+DISKMIND_HEARTBEAT_INTERVAL_MS=15000
 DISKMIND_TOP_SCAN_DEPTH=4
 DISKMIND_TOP_SCAN_MAX_FILES=25000
 
@@ -108,9 +116,13 @@ npm start
 Expected console output includes:
 
 - Path to map database JSON
+- Path to runtime scan log
 - Path to generated cleanup report
 - Path to generated PowerShell script
+- Live `[Progress]` scan updates (processed dirs, queue depth, ETA)
 - Total elapsed runtime
+
+Generated HTML reports include a **Scan Coverage** section that states whether the scan was complete within configured bounds or partial due to iteration cap limits.
 
 ## How It Works
 
@@ -140,6 +152,7 @@ Expected console output includes:
 Generated at runtime:
 
 - `data/diskmind-map.json`
+- `logs/scan-progress-<timestamp>.log` (live runtime scan progress)
 - `reports/cleanup-plan-<timestamp>.txt`
 - `reports/zero-risk-cleanup-<timestamp>.ps1`
 - `logs/llm-calls-<timestamp>.log` (one file per run)
@@ -179,6 +192,9 @@ Reduce scan scope and compute intensity:
 
 - Lower `DISKMIND_MAX_ITERATIONS`
 - Lower `DISKMIND_DIVE_DEPTH`
+- Lower `DISKMIND_MAX_ITEMS_PER_DIR`
+- Lower `DISKMIND_MAX_DIRS_ENQUEUE_PER_SCAN`
+- Set `DISKMIND_FOLDER_SIZE_DEPTH=0` for fastest scans when directory-size estimation is not required
 - Set specific `DISKMIND_ROOTS`
 - Lower `DISKMIND_TOP_SCAN_DEPTH`
 - Lower `DISKMIND_TOP_SCAN_MAX_FILES`

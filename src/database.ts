@@ -103,17 +103,11 @@ export async function prepareMapForRun(map: DiskMindMap): Promise<DiskMindMap> {
     }))
   );
 
-  const existingSavingChecks = await Promise.all(
-    map.potentialSavings.map(async (saving) => ({
-      saving,
-      exists: await fs.pathExists(saving.path)
-    }))
-  );
-
   return {
     scannedPaths: {},
     topFiles: existingTopFileChecks.filter((item) => item.exists).map((item) => item.file),
-    potentialSavings: existingSavingChecks.filter((item) => item.exists).map((item) => item.saving),
+    // Rebuild savings for each run from freshly scanned data only.
+    potentialSavings: [],
     updatedAtISO: new Date().toISOString()
   };
 }

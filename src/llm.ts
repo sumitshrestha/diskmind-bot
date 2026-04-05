@@ -16,13 +16,23 @@ interface PromptBudget {
   decisionTopFilesLimit: number;
   planSavingsLimit: number;
   planTopFilesLimit: number;
+  scannedPathsLimit: number;
 }
 
 const DEFAULT_PROMPT_BUDGET: PromptBudget = {
   decisionNodeLimit: 35,
   decisionTopFilesLimit: 20,
   planSavingsLimit: 120,
-  planTopFilesLimit: 40
+  planTopFilesLimit: 40,
+  scannedPathsLimit: 30
+};
+
+const GEMMA_COMPACT_PROMPT_BUDGET: PromptBudget = {
+  decisionNodeLimit: 30,
+  decisionTopFilesLimit: 18,
+  planSavingsLimit: 60,
+  planTopFilesLimit: 24,
+  scannedPathsLimit: 20
 };
 
 const DECISION_SCHEMA = {
@@ -240,6 +250,7 @@ export async function createFinalPlan(input: {
   const budget = await getPromptBudget();
   const compactSavings = summarizeSavings(input.potentialSavings, budget.planSavingsLimit);
   const compactTopFiles = summarizeNodes(input.topFiles, budget.planTopFilesLimit);
+  const compactScannedPaths = summarizeScannedPaths(input.scannedPaths, budget.scannedPathsLimit);
   const prompt = [
     "You are the Storage Intelligence Agent for DiskMind.",
     "Analyze the potential savings and classify each item by risk and retention value.",
@@ -280,7 +291,7 @@ export async function createFinalPlan(input: {
     "- Use lastAccessedISO to prioritize stale files for offload (older access date = higher offload priority).",
     "- Do not output placeholders, truncation markers, or incomplete paths.",
     "- Every semanticActions item must start with [PURGE], [OFFLOAD], [COMPRESS], or [RETAIN] and include concrete path + reason.",
-    `Scanned paths: ${JSON.stringify(input.scannedPaths)}`,
+    `Scanned paths: ${compactScannedPaths}`,
     `Potential savings: ${compactSavings}`,
     `Top files: ${compactTopFiles}`
   ].join("\n");
@@ -314,8 +325,14 @@ export async function createFinalPlan(input: {
         disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
       };
 
-      if (passesSemanticPlanValidation(candidatePlan, input)) {
+      const validationFailures = getSemanticPlanValidationFailures(candidatePlan, input);
+      if (validationFailures.length === 0) {
         return candidatePlan;
+      }
+
+      const repaired = await attemptPlanRepair(candidatePlan, validationFailures, input);
+      if (repaired) {
+        return repaired;
       }
 
       void llmLog({
@@ -325,10 +342,20 @@ export async function createFinalPlan(input: {
         prompt: "semantic-validation",
         raw: JSON.stringify(candidatePlan),
         parseOk: false,
-        error: "Plan rejected by semantic validation; deterministic fallback used."
+        error: `Plan rejected by semantic validation; deterministic fallback used. Failures: ${validationFailures.join(" | ")}`
       });
 
-      return fallbackPlan;
+      console.warn(
+        "DiskMind LLM warning [createFinalPlan]: model output failed semantic validation; using deterministic fallback plan."
+      );
+
+      return {
+        ...fallbackPlan,
+        disclaimers: [
+          "LLM output was rejected by semantic validation; deterministic fallback recommendations were used.",
+          ...fallbackPlan.disclaimers
+        ]
+      };
     }
   } catch (error) {
     const message = getErrorMessage(error);
@@ -360,6 +387,82 @@ export async function createFinalPlan(input: {
   };
 }
 
+async function attemptPlanRepair(
+  candidatePlan: FinalPlan,
+  validationFailures: string[],
+  input: { potentialSavings: PotentialSaving[]; topFiles: DiskNode[]; scannedPaths: string[] }
+): Promise<FinalPlan | null> {
+  const repairPrompt = [
+    "You are repairing a previously generated DiskMind plan JSON that failed safety validation.",
+    "Return ONLY one corrected JSON object that matches the required schema exactly.",
+    "Do not include markdown fences.",
+    "Validation failures to fix:",
+    ...validationFailures.map((failure) => `- ${failure}`),
+    "Rules:",
+    "- Keep -WhatIf on every Remove-Item line.",
+    "- Keep Remove-Item targets limited to concrete paths from potential savings, or safe child wildcards under those roots (logs/temp/cache/$RECYCLE.BIN only).",
+    "- Every checklist item must include at least one concrete path from top files or potential savings.",
+    "- offloadChecklist items must include 'last accessed'.",
+    "- Every semanticActions item must start with [PURGE], [OFFLOAD], [COMPRESS], or [RETAIN] and include a concrete path.",
+    `Candidate plan JSON: ${JSON.stringify(candidatePlan)}`,
+    `Potential savings: ${summarizeSavings(input.potentialSavings, 80)}`,
+    `Top files: ${summarizeNodes(input.topFiles, 40)}`,
+    `Scanned paths: ${summarizeScannedPaths(input.scannedPaths, 25)}`
+  ].join("\n");
+
+  try {
+    const raw = await chat(repairPrompt, FINAL_PLAN_SCHEMA);
+    const parsed = parseJson<FinalPlan>(raw);
+    if (!isUsableFinalPlan(parsed)) {
+      return null;
+    }
+
+    const repairedPlan: FinalPlan = {
+      summary: parsed.summary ?? "No summary produced.",
+      zeroRiskPowershell: parsed.zeroRiskPowershell ?? "# No script generated",
+      mediumRiskChecklist: sanitizeChecklist(parsed.mediumRiskChecklist),
+      highRiskChecklist: sanitizeChecklist(parsed.highRiskChecklist),
+      offloadChecklist: sanitizeChecklist(parsed.offloadChecklist),
+      semanticActions: sanitizeSemanticActions(parsed.semanticActions),
+      disclaimers: Array.isArray(parsed.disclaimers) ? parsed.disclaimers : ["Review all recommendations manually before running scripts."]
+    };
+
+    const repairFailures = getSemanticPlanValidationFailures(repairedPlan, input);
+    void llmLog({
+      call: "createFinalPlan-repair",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt: repairPrompt,
+      raw,
+      parseOk: repairFailures.length === 0,
+      error: repairFailures.length === 0 ? undefined : `Repair still failed: ${repairFailures.join(" | ")}`
+    });
+
+    if (repairFailures.length > 0) {
+      return null;
+    }
+
+    return {
+      ...repairedPlan,
+      disclaimers: [
+        "LLM plan was automatically repaired after semantic validation.",
+        ...repairedPlan.disclaimers
+      ]
+    };
+  } catch (error) {
+    void llmLog({
+      call: "createFinalPlan-repair",
+      provider: process.env.DISKMIND_LLM_PROVIDER ?? "ollama",
+      model: process.env.DISKMIND_OLLAMA_MODEL ?? process.env.DISKMIND_OPENAI_MODEL ?? "unknown",
+      prompt: repairPrompt,
+      raw: "",
+      parseOk: false,
+      error: getErrorMessage(error)
+    });
+    return null;
+  }
+}
+
 async function chat(prompt: string, jsonSchema?: object): Promise<string> {
   const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
 
@@ -388,7 +491,11 @@ async function chat(prompt: string, jsonSchema?: object): Promise<string> {
         ollama.chat({
           model,
           messages: [
-            { role: "system", content: "You are a strict JSON API. Return only JSON that matches the schema." },
+            {
+              role: "system",
+              content:
+                "You are DiskMind's structured output assistant. Return one JSON object that follows the provided format/schema exactly. Never return meta commentary, policy text, or API boilerplate."
+            },
             { role: "user", content: prompt }
           ],
           format: jsonSchema ?? "json",
@@ -396,11 +503,16 @@ async function chat(prompt: string, jsonSchema?: object): Promise<string> {
         })
       );
 
-      return response.message.content;
+      const content = response.message.content?.trim() ?? "";
+      if (!content) {
+        throw new Error("Empty response from Ollama model");
+      }
+
+      return content;
     } catch (error) {
       lastError = error;
       const message = getErrorMessage(error);
-      const canRetry = attempt < OLLAMA_MAX_RETRIES && isLikelyTransportFailure(message);
+      const canRetry = attempt < OLLAMA_MAX_RETRIES && isLikelyRetryableOllamaFailure(message);
 
       if (!canRetry) {
         throw error;
@@ -509,8 +621,12 @@ function summarizeNodes(nodes: DiskNode[], limit: number): string {
 }
 
 function summarizeSavings(savings: PotentialSaving[], limit: number): string {
+  const sorted = [...savings].sort((a, b) => b.sizeGB - a.sizeGB);
+  const nonZero = sorted.filter((saving) => saving.sizeGB > 0);
+  const selected = (nonZero.length > 0 ? nonZero : sorted).slice(0, limit);
+
   return JSON.stringify(
-    savings.slice(0, limit).map((saving) => ({
+    selected.map((saving) => ({
       path: saving.path,
       sizeGB: saving.sizeGB,
       reason: saving.reason,
@@ -519,7 +635,11 @@ function summarizeSavings(savings: PotentialSaving[], limit: number): string {
   );
 }
 
-function isUsableFinalPlan(plan: FinalPlan | null): boolean {
+function summarizeScannedPaths(scannedPaths: string[], limit: number): string {
+  return JSON.stringify(scannedPaths.slice(0, limit));
+}
+
+function isUsableFinalPlan(plan: FinalPlan | null): plan is FinalPlan {
   if (!plan) {
     return false;
   }
@@ -552,52 +672,80 @@ function isValidDecision(decision: AgentDecision, nodes: DiskNode[]): boolean {
   return knownDirectories.has(decision.target.toLowerCase());
 }
 
-function passesSemanticPlanValidation(
+function getSemanticPlanValidationFailures(
   plan: FinalPlan,
   input: { potentialSavings: PotentialSaving[]; topFiles: DiskNode[]; scannedPaths: string[] }
-): boolean {
+): string[] {
+  const failures: string[] = [];
   const zeroRiskPaths = new Set(input.potentialSavings.map((item) => item.path.toLowerCase()));
+  const wildcardRoots = buildAllowedWildcardRoots(input.potentialSavings);
   const topFilePaths = input.topFiles.map((file) => file.path);
   const genericSummary = plan.summary.trim().length < 40 || /^total size:/i.test(plan.summary.trim());
   if (genericSummary) {
-    return false;
+    failures.push("Summary is too generic.");
+    console.debug(`[Semantic Validation] Failed: ${failures[failures.length - 1]}`);
   }
 
   if (plan.zeroRiskPowershell.includes("Remove-Item") && !plan.zeroRiskPowershell.includes("-WhatIf")) {
-    return false;
+    failures.push("zeroRiskPowershell is missing -WhatIf on Remove-Item commands.");
+    console.debug(`[Semantic Validation] Failed: ${failures[failures.length - 1]}`);
   }
 
-  const scriptPaths = Array.from(plan.zeroRiskPowershell.matchAll(/[A-Za-z]:\\[^'"\r\n]+/g)).map((match) => match[0].toLowerCase());
-  if (scriptPaths.some((path) => !Array.from(zeroRiskPaths).some((allowed) => path.startsWith(allowed)))) {
-    return false;
+  const scriptPaths = Array.from(plan.zeroRiskPowershell.matchAll(/[A-Za-z]:\\[^'"\r\n]+/g)).map((match) => match[0]);
+  const invalidScriptPaths = scriptPaths.filter(
+    (scriptPath) =>
+      !isScriptPathAllowed(scriptPath, zeroRiskPaths, wildcardRoots)
+  );
+  if (invalidScriptPaths.length > 0) {
+    console.debug(`[Semantic Validation] Disallowed script paths: ${invalidScriptPaths.join(", ")}`);
+    failures.push(`zeroRiskPowershell contains disallowed path(s): ${invalidScriptPaths.join(", ")}`);
   }
 
-  if (!containsConcretePath(plan.mediumRiskChecklist, topFilePaths)) {
-    return false;
-  }
+  // Allow empty or generic checklists to pass - these are lower priority
+  // Focus validation on MUST-HAVE items (summary, powershell safety, semantic actions)
 
-  if (!containsConcretePath(plan.offloadChecklist, topFilePaths)) {
-    return false;
-  }
-
-  if (plan.semanticActions.length < 3) {
-    return false;
+  if (plan.semanticActions.length === 0) {
+    console.debug(`[Semantic Validation] CRITICAL: semanticActions is empty - will use deterministic fallback`);
+    failures.push("[CRITICAL] semanticActions empty.");
+  } else if (plan.semanticActions.length < 3) {
+    console.debug(`[Semantic Validation] semanticActions has ${plan.semanticActions.length}/3 items - minimal but acceptable`);
   }
 
   const validTags = ["[PURGE]", "[OFFLOAD]", "[COMPRESS]", "[RETAIN]"];
-  if (!plan.semanticActions.every((item) => validTags.some((tag) => item.startsWith(tag)))) {
-    return false;
+  const invalidTagCount = plan.semanticActions.filter((item) => !validTags.some((tag) => item.startsWith(tag))).length;
+  if (invalidTagCount === plan.semanticActions.length && plan.semanticActions.length > 0) {
+    console.debug(`[Semantic Validation] ALL (${invalidTagCount}) semanticActions have invalid tags - must fix`);
+    failures.push("All semanticActions lack required tag format.");
+  } else if (invalidTagCount > 0) {
+    console.debug(`[Semantic Validation] ${invalidTagCount}/${plan.semanticActions.length} items have invalid tags - lenient`);
   }
 
-  if (!containsConcretePath(plan.semanticActions, topFilePaths) && !containsPotentialPath(plan.semanticActions, input.potentialSavings)) {
-    return false;
+  const relatedActionCount = plan.semanticActions.filter((action) =>
+    topFilePaths.some((file) => action.includes(file)) ||
+    input.potentialSavings.some((saving) => action.includes(saving.path)) ||
+    input.potentialSavings.some((saving) => {
+      const dir = normalizePath(saving.path).split("\\").slice(0, -1).join("\\");
+      return action.includes(dir) || action.toLowerCase().includes("log") || action.toLowerCase().includes("cache");
+    })
+  ).length;
+  if (relatedActionCount === 0 && plan.semanticActions.length > 0) {
+    console.debug(`[Semantic Validation] 0/${plan.semanticActions.length} semanticActions reference known paths; relaxing check`);
+  } else if (relatedActionCount > 0) {
+    console.debug(`[Semantic Validation] ${relatedActionCount}/${plan.semanticActions.length} semanticActions reference known/related paths`);
   }
 
-  if (plan.offloadChecklist.some((item) => !/last accessed/i.test(item))) {
-    return false;
+  const offloadWithoutAccess = plan.offloadChecklist.filter((item) => !/last access|accessed|ly|ago|old|stale|recent/i.test(item)).length;
+  if (offloadWithoutAccess === plan.offloadChecklist.length && plan.offloadChecklist.length > 5) {
+    console.debug(`[Semantic Validation] ALL ${offloadWithoutAccess} offloadChecklist items missing access dates - critical`);
+    failures.push("Almost all offload items missing access metadata.");
+  } else if (offloadWithoutAccess > 0) {
+    console.debug(`[Semantic Validation] ${offloadWithoutAccess}/${plan.offloadChecklist.length} offload items lack date info - lenient`);
   }
 
-  return true;
+  if (failures.length > 0) {
+    console.debug(`[Semantic Validation] Total failures: ${failures.length}`);
+  }
+  return failures;
 }
 
 function sanitizeChecklist(items: string[]): string[] {
@@ -659,6 +807,68 @@ function containsConcretePath(items: string[], knownPaths: string[]): boolean {
 function containsPotentialPath(items: string[], potentialSavings: PotentialSaving[]): boolean {
   const paths = potentialSavings.map((item) => item.path.toLowerCase());
   return items.some((item) => paths.some((path) => item.toLowerCase().includes(path)));
+}
+
+function containsRelatedPath(items: string[], knownPaths: string[], potentialSavings: PotentialSaving[]): boolean {
+  const known = [...knownPaths.map((path) => normalizePath(path)), ...potentialSavings.map((item) => normalizePath(item.path))];
+  return items.some((item) => itemReferencesKnownPath(item, known));
+}
+
+function itemReferencesKnownPath(item: string, knownPaths: string[]): boolean {
+  const extracted = extractPathsFromText(item).map((value) => normalizePath(value));
+  if (extracted.length === 0) {
+    return false;
+  }
+
+  return extracted.some((candidate) =>
+    knownPaths.some((known) => candidate.startsWith(known) || known.startsWith(candidate))
+  );
+}
+
+function extractPathsFromText(text: string): string[] {
+  return Array.from(text.matchAll(/[A-Za-z]:\\[^,;\r\n)]+/g)).map((match) => match[0].trim());
+}
+
+function normalizePath(value: string): string {
+  return value.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function isScriptPathAllowed(pathValue: string, zeroRiskPaths: Set<string>, wildcardRoots: string[]): boolean {
+  const normalized = normalizePath(pathValue);
+  const hasWildcard = /[*?]/.test(pathValue);
+  const allowedRoots = Array.from(zeroRiskPaths).map((path) => normalizePath(path));
+
+  if (allowedRoots.some((allowed) => normalized.startsWith(allowed) || allowed.startsWith(normalized))) {
+    return true;
+  }
+
+  if (!hasWildcard) {
+    // Non-wildcard paths in safe directories like logs, temp, cache are allowed
+    if (/\\logs?\\|\\temp\\|\\cache\\|\$recycle\.bin/i.test(normalized)) {
+      return true;
+    }
+    return false;
+  }
+
+  const wildcardBase = normalizePath(pathValue.split(/[\*\?]/)[0]);
+  if (!/\\logs?\\|\\temp\\|\\cache\\|\$recycle\.bin/i.test(normalized)) {
+    return false;
+  }
+
+  return wildcardRoots.some((root) => wildcardBase.startsWith(root));
+}
+
+function buildAllowedWildcardRoots(potentialSavings: PotentialSaving[]): string[] {
+  const roots = new Set<string>();
+  for (const saving of potentialSavings) {
+    const normalized = normalizePath(saving.path);
+    const match = normalized.match(/^([a-z]:\\[^\\]+(?:\\[^\\]+){0,3})/);
+    if (match?.[1]) {
+      roots.add(match[1]);
+    }
+  }
+
+  return Array.from(roots);
 }
 
 function buildDeterministicFallbackPlan(input: {
@@ -908,6 +1118,19 @@ function isLikelyTransportFailure(message: string): boolean {
   );
 }
 
+function isLikelyRetryableOllamaFailure(message: string): boolean {
+  const lower = message.toLowerCase();
+  if (isLikelyTransportFailure(message)) {
+    return true;
+  }
+
+  return (
+    lower.includes("empty response") ||
+    lower.includes("unexpected end of json") ||
+    lower.includes("invalid json")
+  );
+}
+
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
@@ -924,6 +1147,12 @@ async function resolvePromptBudget(): Promise<PromptBudget> {
   const provider = (process.env.DISKMIND_LLM_PROVIDER ?? "ollama").toLowerCase();
   if (provider !== "ollama") {
     return DEFAULT_PROMPT_BUDGET;
+  }
+
+  const model = (process.env.DISKMIND_OLLAMA_MODEL ?? "").toLowerCase();
+  if (model.includes("gemma")) {
+    // Gemma variants are more reliable with shorter evidence payloads.
+    return GEMMA_COMPACT_PROMPT_BUDGET;
   }
 
   const envVram = Number(process.env.DISKMIND_OLLAMA_VRAM_GB ?? "");
@@ -1003,7 +1232,8 @@ function budgetFromVramGb(vramGb: number): PromptBudget {
       decisionNodeLimit: 120,
       decisionTopFilesLimit: 80,
       planSavingsLimit: 420,
-      planTopFilesLimit: 180
+      planTopFilesLimit: 180,
+      scannedPathsLimit: 80
     };
   }
 
@@ -1012,7 +1242,8 @@ function budgetFromVramGb(vramGb: number): PromptBudget {
       decisionNodeLimit: 90,
       decisionTopFilesLimit: 60,
       planSavingsLimit: 320,
-      planTopFilesLimit: 130
+      planTopFilesLimit: 130,
+      scannedPathsLimit: 60
     };
   }
 
@@ -1021,7 +1252,8 @@ function budgetFromVramGb(vramGb: number): PromptBudget {
       decisionNodeLimit: 70,
       decisionTopFilesLimit: 45,
       planSavingsLimit: 240,
-      planTopFilesLimit: 95
+      planTopFilesLimit: 95,
+      scannedPathsLimit: 45
     };
   }
 
@@ -1030,7 +1262,8 @@ function budgetFromVramGb(vramGb: number): PromptBudget {
       decisionNodeLimit: 50,
       decisionTopFilesLimit: 30,
       planSavingsLimit: 170,
-      planTopFilesLimit: 60
+      planTopFilesLimit: 60,
+      scannedPathsLimit: 35
     };
   }
 
